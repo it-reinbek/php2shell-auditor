@@ -1,0 +1,26 @@
+# Temporäre Scan- und Logdateien
+.php2shell-last-scan.txt
+php2shell-actions.log
+*.log
+
+# Lokale Zustands- und Cache-Verzeichnisse
+.php2shell-state/
+
+# Automatisch erzeugte Backups und Beweise
+php2shell-backup-*/
+php2shell-evidence-*/
+php2shell-quarantine-*/
+php2shell-snippets/
+
+# Generierte Checklisten und Berichte
+php2shell-checkliste-*.txt
+php2shell-revisionsbericht-*.txt
+
+# Betriebssystem- und Editor-Dateien
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
