@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![BSI Criticality: Orange](https://img.shields.io/badge/BSI%20Criticality-3%20of%204%20(Orange)-orange.svg)](https://www.bsi.bund.de)
 [![CVSS: 9.2](https://img.shields.io/badge/CVSS-9.2%20(Critical)-red.svg)](https://nvd.nist.gov)
-[![Version: 1.3.0](https://img.shields.io/badge/Release-v1.3.0-green.svg)](https://github.com/it-reinbek/php2shell-auditor/releases)
+[![Version: 1.3.1](https://img.shields.io/badge/Release-v1.3.1-green.svg)](https://github.com/it-reinbek/php2shell-auditor/releases)
 
 Language / Sprache: **[🇬🇧 English](#-english-version)** | **[🇩🇪 Deutsch](#-deutsche-version)**
 
@@ -15,7 +15,7 @@ Interactive open-source Bash audit and emergency remediation tool designed to de
 
 Developed by [IT-Reinbek](https://it-reinbek.de/php2shell-auditor/) · Documentation & Online Check: [it-reinbek.de/php2shell-auditor](https://it-reinbek.de/php2shell-auditor/)
 
-### 🔍 Key Features (v1.3.0)
+### 🔍 Key Features (v1.3.1)
 
 * **Host & Live Container Audit:** Checks CLI binaries, active PHP-FPM pools, Apache `mod_php`, and running Docker containers.
 * **Distro Backport Detection:** Automatically identifies official upstream patches (>= 8.5.12, 8.4.27, 8.3.36, 8.2.35) and backports for EOL branches (7.4, 8.0, 8.1) across Debian, Ubuntu, RHEL, Plesk, and Remi.
@@ -23,6 +23,7 @@ Developed by [IT-Reinbek](https://it-reinbek.de/php2shell-auditor/) · Documenta
   * Audits `session.upload_progress.enabled` (active attack surface for CVE-2026-109619).
   * Detects emergency workarounds (`memory_limit = -1`) and prompts administrators to restore finite limits after patching.
   * Inspects `fatal_error_backtraces` on PHP 8.5.
+  * Audits `display_errors` (prevents address leaks and ASLR bypasses) and `session.use_strict_mode` (prevents session fixation and malicious session IDs).
 * **100% Reversible Mitigations (TUI):** One-key toggle for BSI/CERT-EU configuration drop-ins (`99-php2shell-mitigation.ini`) and systemd cgroup memory limits (`MemoryMax=2G`).
 * **Safe Docker-Compose Workflow:** Shuts down stacks safely via `docker compose down` (releasing file/db locks), archives mounts, tags rollback images, and pulls patched versions.
 * **Forensic Heuristics:** Detects heap-spraying session artifacts (> 512 KB) and crash waves (ASLR brute-forcing) in syslog and journalctl.
@@ -81,7 +82,7 @@ Interaktives Open-Source-Bash-Audit- und Notfall-Remediation-Tool zur Erkennung 
 
 Entwickelt von [IT-Reinbek](https://it-reinbek.de/php2shell-auditor/) · Dokumentation & Online-Check: [it-reinbek.de/php2shell-auditor](https://it-reinbek.de/php2shell-auditor/)
 
-### 🔍 Wichtigste Funktionen (v1.3.0)
+### 🔍 Wichtigste Funktionen (v1.3.1)
 
 * **Host- & Live-Docker-Inspektion:** Prüft installierte CLI-Binaries, aktive PHP-FPM-Dienste, Apache `mod_php` sowie alle laufenden Docker-Container auf verwundbare PHP-Versionen.
 * **Erkennung von Distro-Backports:** Erkennt offizielle Upstream-Patches sowie Distribution-Backports (Debian LTS, Ubuntu Pro, RHEL, Plesk, Remi, Sury) für PHP 7.4, 8.0 und 8.1 anhand von Paket-Changelogs und Build-Daten.
@@ -89,6 +90,7 @@ Entwickelt von [IT-Reinbek](https://it-reinbek.de/php2shell-auditor/) · Dokumen
   * Prüft, ob `session.upload_progress.enabled` aktiv ist (Angriffsfläche für CVE-2026-109619).
   * Erkennt Notfall-Workarounds (`memory_limit = -1`) und erinnert Administratoren an das Zurücksetzen nach dem Patch.
   * Prüft `fatal_error_backtraces` unter PHP 8.5.
+  * Warnt bei aktivem `display_errors` (Adress-Leaks / ASLR-Bypass) sowie inaktivem `session.use_strict_mode` (Session-Fixation / bösartige Session-IDs).
 * **100 % rückabwickelbare Workarounds (Toggle On / Off):**
   * BSI-Konfigurations-Drop-in (`99-php2shell-mitigation.ini`) mit einem Tastendruck menügeführt aktivieren und rückstandslos wieder entfernen.
   * systemd-cgroup-Speicherlimits (`MemoryMax=2G`) für PHP-FPM und Webserver einrichten.

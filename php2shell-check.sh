@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 #
-# php2shell-check.sh  (v1.3.0 - Stateful TUI, Reversible Config & Emergency-Patch Edition)
+# php2shell-check.sh  (v1.3.1 - Stateful TUI, Reversible Config & Emergency-Patch Edition)
 # Prüft PHP auf CVE-2026-109618 (GHSA-w8hw-w9fx-j79w) & CVE-2026-109619 (GHSA-6wmf-4rv5-p3rp) ("PHP2Shell"),
 # berücksichtigt den BSI-IT-Sicherheitshinweis BITS-H Nr. 2026-297981-1132 (Version 1.1 vom 21.10.2026),
 # die Notfall-Updates (8.5.12 / 8.4.27 / 8.3.36 / 8.2.35 + EOL-Backports für 7.4 / 8.0 / 8.1)
 # sowie tagesaktuelle Analysen/IOCs (Armis, Abstract Security, Datadog, Sansec, Corelight, IT-Administrator).
 #
-# Neu in v1.3.0:
+# Neu in v1.3.1:
+# - Erweiterte Runtime-Inspektion & Drop-in-Härtung um display_errors (Schutz vor Adress-Leaks / ASLR-Bypass)
+#   und session.use_strict_mode (Schutz vor Session-Fixation / bösartigen Session-IDs).
 # - Erweiterte Runtime-Inspektion in check_runtime (session.upload_progress.enabled, memory_limit=-1,
 #   fatal_error_backtraces unter PHP 8.5).
 # - Mehrsprachigkeit (Deutsch/Englisch): Auto-Erkennung über LANG/LC_ALL, CLI-Parameter --lang <de|en>
@@ -31,7 +33,7 @@
 #
 set -uo pipefail
 
-VERSION="1.3.0"
+VERSION="1.3.1"
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 SINCE="2026-10-17"
 REPORT=""
@@ -564,7 +566,7 @@ check_runtime() {
 
   php=$(command -v php || true)
   if [ -n "$php" ]; then
-    local php_branch
+    local php_branch de_err strict_mode
     php_branch=$("$php" -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true)
     up=$("$php" -r 'echo ini_get("session.upload_progress.enabled");' 2>/dev/null)
     ml=$("$php" -r 'echo ini_get("memory_limit");' 2>/dev/null)
@@ -572,7 +574,9 @@ check_runtime() {
     umf=$("$php" -r 'echo ini_get("upload_max_filesize");' 2>/dev/null)
     feb=$("$php" -r 'echo ini_get("fatal_error_backtraces");' 2>/dev/null)
     expose=$("$php" -r 'echo ini_get("expose_php");' 2>/dev/null)
-    info "CLI-Konfig: upload_progress=${up:-0}, memory_limit=${ml:-?}, post_max_size=${pms:-?}, upload_max_filesize=${umf:-?}, fatal_error_backtraces=${feb:-n/a}, expose_php=${expose:-0} (FPM/Apache können abweichen!)"
+    de_err=$("$php" -r 'echo ini_get("display_errors");' 2>/dev/null)
+    strict_mode=$("$php" -r 'echo ini_get("session.use_strict_mode");' 2>/dev/null)
+    info "CLI-Konfig: upload_progress=${up:-0}, memory_limit=${ml:-?}, post_max_size=${pms:-?}, upload_max_filesize=${umf:-?}, fatal_error_backtraces=${feb:-n/a}, expose_php=${expose:-0}, display_errors=${de_err:-0}, use_strict_mode=${strict_mode:-0} (FPM/Apache können abweichen!)"
     if [ "${up:-0}" = "1" ]; then
       warn "session.upload_progress.enabled=1 ist aktiv: Ermöglicht das Manipulieren von Session-Daten ohne Upload-Skript und dient als primärer Angriffsvektor für CVE-2026-109619 (BSI/CERT-EU-Empfehlung: auf 0 setzen)."
     fi
@@ -585,6 +589,16 @@ check_runtime() {
     if [ "${expose:-0}" = "1" ]; then
       warn "expose_php=1 aktiv: Server verrät seine PHP-Version im HTTP-Header 'X-Powered-By' an Angreifer/Scanner (Corelight-Hinweis)."
     fi
+    case "${de_err,,}" in
+      1|on|true)
+        warn "WARNUNG: display_errors ist aktiv! Ermöglicht Angreifern Adress-Leaks und ASLR-Bypasses."
+        ;;
+    esac
+    case "${strict_mode,,}" in
+      ""|0|off)
+        warn "WARNUNG: session.use_strict_mode=0 (inaktiv)! Erleichtert Session-Fixation und Einschleusen bösartiger Session-IDs."
+        ;;
+    esac
   fi
 
   local mem_unlim_files
@@ -2345,7 +2359,9 @@ act_mitig_bsi_ini() {
      - session.upload_progress.enabled = 0  (BSI-Workaround für CVE-2026-109619)
      - fatal_error_backtraces = 0           (BSI-Workaround für CVE-2026-109619 unter PHP 8.5)
      - post_max_size = 8M (ohne Uploads) bzw. 32M (mit Uploads) + angepasstes upload_max_filesize (BSI-Workaround für CVE-2026-109618)
-     - expose_php = 0                       (verhindert Versions-Leak über X-Powered-By Header)" \
+     - expose_php = 0                       (verhindert Versions-Leak über X-Powered-By Header)
+     - display_errors = Off                 (verhindert Adress-Leaks und ASLR-Bypasses)
+     - session.use_strict_mode = 1          (verhindert Session-Fixation und uninitialisierte Session-IDs)" \
     "Upload-Fortschrittsbalken über Sessions sind deaktiviert; Request-Body-Größe wird auf 8M bzw. 32M begrenzt. Wirksam erst nach Dienst-Neustart." \
     "Checkbox [7] in der TUI wieder abwählen (entfernt $MARK_INI wieder)"
   tty_read -r -p "Benötigen deine Webanwendungen Datei-Uploads? [J/n] (j = post_max_size 32M, n = post_max_size 8M laut BSI): " mode || return 0
@@ -2363,6 +2379,8 @@ fatal_error_backtraces = 0
 post_max_size = $pms
 upload_max_filesize = $umf
 expose_php = 0
+display_errors = Off
+session.use_strict_mode = 1
 EOF
     chmod 644 "$d/$MARK_INI"
     info "angelegt: $d/$MARK_INI"
