@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![BSI Criticality: Orange](https://img.shields.io/badge/BSI%20Criticality-3%20of%204%20(Orange)-orange.svg)](https://www.bsi.bund.de)
 [![CVSS: 9.2](https://img.shields.io/badge/CVSS-9.2%20(Critical)-red.svg)](https://nvd.nist.gov)
-[![Version: 1.3.1](https://img.shields.io/badge/Release-v1.3.1-green.svg)](https://github.com/it-reinbek/php2shell-auditor/releases)
+[![Version: 1.4.0](https://img.shields.io/badge/Release-v1.4.0-green.svg)](https://github.com/it-reinbek/php2shell-auditor/releases)
 
 Language / Sprache: **[🇬🇧 English](#-english-version)** | **[🇩🇪 Deutsch](#-deutsche-version)**
 
@@ -15,8 +15,11 @@ Interactive open-source Bash audit and emergency remediation tool designed to de
 
 Developed by [IT-Reinbek](https://it-reinbek.de/php2shell-auditor/) · Documentation & Online Check: [it-reinbek.de/php2shell-auditor](https://it-reinbek.de/php2shell-auditor/)
 
-### 🔍 Key Features (v1.3.1)
+### 🔍 Key Features (v1.4.0)
 
+* **3-Step Full-Screen Box TUI:** Unified wizard & split-box TUI (Step 1/3 Legal Disclaimer, Step 2/3 System Audit & Findings Overview, Step 3/3 Interactive Remediation Menu 1–17) preserving the color-coded state markers (`[x]` Active, `[+]` New, `[-]` Rollback, `[ ]` Inactive).
+* **ClamAV Malware & Webshell Protection (Real-Time vs. Cronjob):**
+  * Automatically analyzes available RAM (`MemAvailable` + running `clamd` RSS) and recommends **Real-Time On-Access (`clamd` + `clamonacc --fdpass`)** (>= 3500 MB free RAM) or **Scheduled Nightly Scan (`clamav-scan.timer` / Cronjob at 03:30 without resident daemon)** (>= 1800 MB free RAM).
 * **Host & Live Container Audit:** Checks CLI binaries, active PHP-FPM pools, Apache `mod_php`, and running Docker containers.
 * **Distro Backport Detection:** Automatically identifies official upstream patches (>= 8.5.12, 8.4.27, 8.3.36, 8.2.35) and backports for EOL branches (7.4, 8.0, 8.1) across Debian, Ubuntu, RHEL, Plesk, and Remi.
 * **Extended Runtime Inspections (CERT-EU / BSI / CISA):**
@@ -82,8 +85,11 @@ Interaktives Open-Source-Bash-Audit- und Notfall-Remediation-Tool zur Erkennung 
 
 Entwickelt von [IT-Reinbek](https://it-reinbek.de/php2shell-auditor/) · Dokumentation & Online-Check: [it-reinbek.de/php2shell-auditor](https://it-reinbek.de/php2shell-auditor/)
 
-### 🔍 Wichtigste Funktionen (v1.3.1)
+### 🔍 Wichtigste Funktionen (v1.4.0)
 
+* **3-stufiges Vollbild-Box-TUI:** Durchgängiges Box-TUI im IT-Reinbek-Design (Schritt 1/3 Rechtlicher Hinweis, Schritt 2/3 Systemprüfung & Befund-Screen, Schritt 3/3 Split-Box-Maßnahmen-Menü 1–17) mit farbcodierten Statusmarkern (`[x]` Aktiv, `[+]` Neu, `[-]` Rückbau, `[ ]` Inaktiv).
+* **ClamAV Malware- & Webshell-Schutz (Echtzeit vs. Cronjob):**
+  * Automatische RAM-Analyse (`MemAvailable` + laufendes `clamd`) mit Empfehlung für **Echtzeit-Überwachung (`clamd` + `clamonacc --fdpass`)** (ab 3500 MB frei) oder **Zeitplan-/Cronjob-Scan (`clamav-scan.timer` täglich 03:30 Uhr ohne Dauer-Daemon)** (ab 1800 MB frei).
 * **Host- & Live-Docker-Inspektion:** Prüft installierte CLI-Binaries, aktive PHP-FPM-Dienste, Apache `mod_php` sowie alle laufenden Docker-Container auf verwundbare PHP-Versionen.
 * **Erkennung von Distro-Backports:** Erkennt offizielle Upstream-Patches sowie Distribution-Backports (Debian LTS, Ubuntu Pro, RHEL, Plesk, Remi, Sury) für PHP 7.4, 8.0 und 8.1 anhand von Paket-Changelogs und Build-Daten.
 * **Erweiterte Runtime-Inspektion (BSI / CERT-EU / CISA):**

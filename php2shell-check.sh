@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 #
-# php2shell-check.sh  (v1.3.1 - Stateful TUI, Reversible Config & Emergency-Patch Edition)
+# php2shell-check.sh  (v1.4.0 - Stateful TUI, Reversible Config & Emergency-Patch Edition)
 # Prüft PHP auf CVE-2026-109618 (GHSA-w8hw-w9fx-j79w) & CVE-2026-109619 (GHSA-6wmf-4rv5-p3rp) ("PHP2Shell"),
 # berücksichtigt den BSI-IT-Sicherheitshinweis BITS-H Nr. 2026-297981-1132 (Version 1.1 vom 21.10.2026),
 # die Notfall-Updates (8.5.12 / 8.4.27 / 8.3.36 / 8.2.35 + EOL-Backports für 7.4 / 8.0 / 8.1)
 # sowie tagesaktuelle Analysen/IOCs (Armis, Abstract Security, Datadog, Sansec, Corelight, IT-Administrator).
 #
-# Neu in v1.3.1:
+# Neu in v1.4.0:
+# - 3-stufiges Vollbild-Box-TUI analog zum IT-Reinbek-Härtungsskript (Schritt 1/3: Rechtlicher Hinweis,
+#   Schritt 2/3: Systemprüfung & Befund-Screen, Schritt 3/3: Split-Box-Maßnahmen-Menü 1-17) unter
+#   Beibehaltung der Original-Farben & Marker ([x] Grün, [+] Gelb, [-] Rot, [ ] Weiß).
+# - ClamAV Malwareschutz (#17) mit automatischer RAM-Analyse & Empfehlung (Echtzeit clamd + clamonacc
+#   On-Access ab 3500 MB frei vs. täglicher Zeitplan-/Cronjob-Scan um 03:30 Uhr ab 1800 MB frei).
 # - Erweiterte Runtime-Inspektion & Drop-in-Härtung um display_errors (Schutz vor Adress-Leaks / ASLR-Bypass)
 #   und session.use_strict_mode (Schutz vor Session-Fixation / bösartigen Session-IDs).
 # - Erweiterte Runtime-Inspektion in check_runtime (session.upload_progress.enabled, memory_limit=-1,
@@ -17,7 +22,7 @@
 #   auch nach der Hintergrund-Aufzeichnung (tee) unter sudo, SSH und Tabby.
 # - Erweiterte Erkennung der Notfall-Backports für PHP 7.4, 8.0 und 8.1 (Changelog + Build-Datum >= 21.10.2026).
 # - Vorgeschalteter rechtlicher Haftungsausschluss (Disclaimer zur Nutzung in Eigenverantwortung).
-# - Zustandsbasierte Split-Screen-TUI (Links Checkboxen 1-16 ohne Zähllücken, rechts Live-Erklärung):
+# - Zustandsbasierte Split-Screen-TUI (Links Checkboxen 1-17 ohne Zähllücken, rechts Live-Erklärung):
 #     * [x] (Grün)  = Maßnahme/Konfiguration ist bereits auf dem System AKTIV / angewendet
 #     * [ ] (Weiß)  = Maßnahme/Konfiguration ist NICHT aktiv
 #     * [+] (Gelb)  = Neu ausgewählt -> wird beim Ausführen [Enter] AKTIVIERT / installiert
@@ -33,7 +38,7 @@
 #
 set -uo pipefail
 
-VERSION="1.3.1"
+VERSION="1.4.0"
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 SINCE="2026-10-17"
 REPORT=""
@@ -203,116 +208,189 @@ ensure_state_dir() {
 
 # ======================================================= Rechtlicher Disclaimer
 
+tui_topbar() {
+  local cols="$1" left="$2" right="$3" pad
+  pad=$(( cols - ${#left} - ${#right} ))
+  [ "$pad" -lt 1 ] && pad=1
+  printf '\e[44;97;1m%s%*s%s\e[0m\n' "$left" "$pad" "" "$right"
+}
+
+tui_single_box_top() {
+  local cols="$1" title="$2" more_up="${3:-0}" inner fill up_str=""
+  inner=$(( cols - 2 ))
+  if [ "$more_up" -eq 1 ]; then
+    if [ "$UI_LANG" = "en" ]; then up_str=" ^more "; else up_str=" ^mehr "; fi
+  fi
+  fill=$(( inner - ${#title} - ${#up_str} - 4 ))
+  [ "$fill" -lt 1 ] && fill=1
+  printf '%s+-- %s%s%s %s%s%s%s+%s\n' "$C" "$C$B" "$title" "$N$C" "$(printf '%*s' "$fill" '' | tr ' ' '-')" "$Y" "$up_str" "$C" "$N"
+}
+
+tui_single_box_bot() {
+  local cols="$1" more_dn="${2:-0}" inner fill dn_str=""
+  inner=$(( cols - 2 ))
+  if [ "$more_dn" -eq 1 ]; then
+    if [ "$UI_LANG" = "en" ]; then dn_str=" PgDn v more "; else dn_str=" Bild v mehr "; fi
+  fi
+  fill=$(( inner - ${#dn_str} ))
+  [ "$fill" -lt 1 ] && fill=1
+  printf '%s+%s%s%s%s+%s\n' "$C" "$(printf '%*s' "$fill" '' | tr ' ' '-')" "$Y" "$dn_str" "$C" "$N"
+}
+
 show_legal_disclaimer() {
   [ "$ACCEPT_DISCLAIMER" -eq 1 ] && return 0
   [ "$NO_MENU" -eq 1 ] && return 0
   [ "$HAS_TTY" -eq 1 ] || return 0
 
-  clear
-  if [ "$UI_LANG" = "en" ]; then
-    cat <<EOF
-${B}${R}================================================================================
-              IMPORTANT LEGAL NOTICE & DISCLAIMER OF LIABILITY
-================================================================================${N}
+  local scroll=0 key k2 k3
+  while true; do
+    local cols rows box_h text_w
+    cols=$(tput cols 2>/dev/null || echo 118)
+    rows=$(tput lines 2>/dev/null || echo 34)
+    [ "$cols" -lt 80 ] && cols=80
+    [ "$rows" -lt 22 ] && rows=22
+    box_h=$(( rows - 5 ))
+    text_w=$(( cols - 6 ))
 
-This script (${B}php2shell-check.sh v${VERSION}${N}) is designed for security auditing and
-assisted containment/remediation of ${B}CVE-2026-109618${N} and ${B}CVE-2026-109619 ("PHP2Shell")${N}.
+    local raw_disc step_title box_title status_line key_line
+    if [ "$UI_LANG" = "en" ]; then
+      step_title="Step 1/3 - Legal Disclaimer "
+      box_title="Disclaimer & Terms of Use (BSI Advisory)"
+      status_line=" Please read carefully. Press [Enter] or [y] to accept and start the read-only system audit."
+      key_line=" Up/Down/PgDn: scroll | Enter/y: I ACCEPT (Start Audit) | l: Language (DE/EN) | q: Quit"
+      raw_disc=$(cat <<EOF
+${R}${B}IMPORTANT LEGAL NOTICE & DISCLAIMER OF LIABILITY${N}
 
-${B}1. Provided "AS IS" & Sole Responsibility${N}
-This script is provided free of charge and used at the sole risk and full
-responsibility of the user/operator. No warranty of any kind is given regarding
-accuracy, completeness, timeliness, absence of errors, or fitness for purpose.
+This tool (${B}IT-Reinbek PHP2Shell-Auditor v${VERSION}${N}) is designed for security auditing and assisted containment/remediation of ${B}CVE-2026-109618${N} and ${B}CVE-2026-109619 ("PHP2Shell")${N}.
 
-${B}2. No Guarantee of Detection or Complete Protection${N}
-A scan with zero findings ("0 CRIT / 0 WARN") is NOT proof that the system has
-not been compromised. Temporary workarounds per BSI (BITS-H 2026-297981-1132)
-do not replace official security patches.
+${C}${B}1. Provided "AS IS" & Sole Responsibility${N}
+This script is provided free of charge and used at the sole risk and full responsibility of the user/operator. No warranty of any kind is given regarding accuracy, completeness, timeliness, absence of errors, or fitness for purpose.
 
-${B}3. System Modifications, Rollback & Operational Risks${N}
-The initial scan is strictly read-only. However, if you actively enable or revert
-remediation steps in the subsequent TUI menu (package updates, PHP branch switch,
-Docker Compose stop/recreate, config changes, quarantine), the script modifies
-the live system. Despite built-in backups and rollback mechanisms, service
-interruptions, incompatibilities, or data loss may occur.
+${C}${B}2. No Guarantee of Detection or Complete Protection${N}
+A scan with zero findings ("0 CRIT / 0 WARN") is NOT proof that the system has not been compromised. Temporary workarounds per BSI (BITS-H 2026-297981-1132) do not replace official security patches.
 
-${B}4. Limitation of Liability (pursuant to German law, §§ 521, 599, 276 BGB)${N}
-Any liability of the authors or contributors for direct or indirect damages,
-consequential damages, data loss, or system downtime is excluded, unless caused
-by intent, gross negligence, or mandatory statutory liability.
+${C}${B}3. System Modifications, Rollback & Operational Risks${N}
+The initial scan (Step 2/3) is strictly read-only. However, if you actively enable or revert remediation steps in the subsequent TUI menu (Step 3/3: package updates, PHP branch switch, Docker Compose stop/recreate, config changes, quarantine), the script modifies the live system. Despite built-in backups and rollback mechanisms, service interruptions, incompatibilities, or data loss may occur.
 
-${B}5. Authorization${N}
-You confirm that you are authorized to audit and administer this system and that
-current external backups exist.
-${R}================================================================================${N}
+${C}${B}4. Limitation of Liability (pursuant to German law, §§ 521, 599, 276 BGB)${N}
+Any liability of the authors or contributors for direct or indirect damages, consequential damages, data loss, or system downtime is excluded, unless caused by intent, gross negligence, or mandatory statutory liability.
+
+${C}${B}5. Authorization & Backups${N}
+By pressing ${G}${B}[Enter]${N} or ${G}${B}[y]${N}, you confirm that you are authorized to audit and administer this system, that current external backups exist, and that you accept this disclaimer.
 EOF
-    local ans
-    printf '\nPlease type %sI ACCEPT%s (or %sYES%s) to acknowledge the disclaimer and start the\naudit at your own risk (anything else aborts):\n> ' "$B$G" "$N" "$B$G" "$N"
-    tty_read -r ans || exit 1
-    case "$ans" in
-      "I ACCEPT"|"i accept"|"YES"|"yes"|"ICH AKZEPTIERE"|"ich akzeptiere"|"JA"|"ja")
-        alog "Legal disclaimer accepted by user ($(id -un))."
-        printf '%sDisclaimer accepted. Starting system audit ...%s\n\n' "$G" "$N"
+)
+    else
+      step_title="Schritt 1/3 - Rechtlicher Hinweis "
+      box_title="Haftungsausschluss & Nutzungsbedingungen (Disclaimer)"
+      status_line=" Bitte sorgfaeltig lesen. Mit [Enter] oder [j] akzeptieren Sie und starten die lesende Systempruefung."
+      key_line=" Pfeile/Bild: scrollen | Enter/j: ICH AKZEPTIERE (Scan starten) | l: Sprache (DE/EN) | q: Abbruch"
+      raw_disc=$(cat <<EOF
+${R}${B}WICHTIGER RECHTLICHER HINWEIS & HAFTUNGSAUSSCHLUSS (DISCLAIMER)${N}
+
+Dieses Werkzeug (${B}IT-Reinbek PHP2Shell-Auditor v${VERSION}${N}) dient der Sicherheitsanalyse sowie der unterstuetzten Eindaemmung und Behebung der Schwachstellen ${B}CVE-2026-109618${N} und ${B}CVE-2026-109619 ("PHP2Shell")${N}.
+
+${C}${B}1. Bereitstellung ohne Gewaehr ("AS IS") & Eigenverantwortung${N}
+Die Bereitstellung und Nutzung dieses Skripts erfolgt unentgeltlich und auf alleinige Gefahr sowie in voller Eigenverantwortung des Anwenders/Betreibers. Es wird keinerlei Gewaehrleistung fuer Richtigkeit, Vollstaendigkeit, Aktualitaet, Fehlerfreiheit oder die Eignung fuer einen bestimmten Zweck uebernommen.
+
+${C}${B}2. Keine Garantie auf Erkennung oder vollstaendigen Schutz${N}
+Ein Scan ohne Treffer ("0 CRIT / 0 WARN") ist KEIN Beweis dafuer, dass das System nicht kompromittiert wurde. Ebenso ersetzen temporaere Workarounds laut BSI (BITS-H Nr. 2026-297981-1132) keinen offiziellen Sicherheits-Patch.
+
+${C}${B}3. Systemeingriffe, Rueckabwicklung & Betriebsrisiken${N}
+Der initiale Scan (Schritt 2/3) arbeitet rein lesend. Wenn Sie im anschliessenden TUI-Menue (Schritt 3/3) jedoch aktiv Massnahmen aktivieren oder deaktivieren (z. B. Paket-Updates, PHP-Branch-Wechsel, Docker-Compose-Stopp/Recreate, Konfigurationsaenderungen, Quarantaene oder deren Rueckabwicklung), greift das Skript tief in das laufende System ein. Trotz integrierter Backups und Rollback-Mechanismen kann es zu Dienstunterbrechungen, Inkompatibilitaeten oder Datenverlust kommen.
+
+${C}${B}4. Haftungsbeschraenkung (gemaess deutschem Recht, §§ 521, 599, 276 BGB)${N}
+Jegliche Haftung der Autoren, Bereitsteller oder Mitwirkenden fuer direkte oder indirekte Schaeden, Folgeschaeden, Datenverlust, Systemausfaelle oder entgangenen Gewinn ist ausgeschlossen, soweit diese nicht auf Vorsatz oder grober Fahrlaessigkeit beruhen oder eine zwingende gesetzliche Haftung besteht.
+
+${C}${B}5. Autorisierung & Bestaetigung${N}
+Mit Druck auf ${G}${B}[Enter]${N} oder ${G}${B}[j]${N} bestaetigen Sie, dass Sie berechtigt sind, dieses System zu pruefen und ggf. administrativ zu veraendern, dass aktuelle externe Backups vorliegen und dass Sie diesen Haftungsausschluss in Eigenverantwortung akzeptieren.
+EOF
+)
+    fi
+
+    local -a dlines=("")
+    local rline wline
+    while IFS= read -r rline; do
+      if [ -z "$rline" ]; then
+        dlines+=("")
+      else
+        while IFS= read -r wline; do
+          dlines+=("$wline")
+        done < <(printf '%s\n' "$rline" | fold -s -w "$text_w")
+      fi
+    done <<< "$raw_disc"
+
+    local total="${#dlines[@]}"
+    local max_scroll=$(( total - box_h ))
+    [ "$max_scroll" -lt 0 ] && max_scroll=0
+    [ "$scroll" -gt "$max_scroll" ] && scroll="$max_scroll"
+    [ "$scroll" -lt 0 ] && scroll=0
+
+    local more_up=0 more_dn=0
+    [ "$scroll" -gt 0 ] && more_up=1
+    [ $(( scroll + box_h )) -lt "$total" ] && more_dn=1
+
+    printf '\e[H\e[2J'
+    tui_topbar "$cols" " IT-Reinbek PHP2Shell-Auditor v${VERSION}" "$step_title"
+    tui_single_box_top "$cols" "$box_title" "$more_up"
+
+    local idx line plain plen pad
+    for (( idx=0; idx<box_h; idx++ )); do
+      line="${dlines[$(( scroll + idx ))]:-}"
+      plain=$(printf '%s' "$line" | sed $'s/\e\\[[0-9;]*[a-zA-Z]//g')
+      plen="${#plain}"
+      pad=$(( cols - 4 - plen ))
+      [ "$pad" -lt 0 ] && pad=0
+      printf '%s|%s %s%*s %s|%s\n' "$C" "$N" "$line" "$pad" "" "$C" "$N"
+    done
+
+    tui_single_box_bot "$cols" "$more_dn"
+    printf '%s%s%s\n' "$C" "${status_line:0:$cols}" "$N"
+    printf '%s%s%s' "$B" "${key_line:0:$cols}" "$N"
+
+    IFS= tty_read -rsn1 key || exit 1
+    if [[ "$key" == $'\e' ]]; then
+      IFS= tty_read -rsn1 -t 0.05 k2 || k2=""
+      if [[ "$k2" == "[" ]]; then
+        IFS= tty_read -rsn1 -t 0.05 k3 || k3=""
+        case "$k3" in
+          A) scroll=$(( scroll - 1 )) ;;
+          B) scroll=$(( scroll + 1 )) ;;
+          5) IFS= tty_read -rsn1 -t 0.02 _ || true; scroll=$(( scroll - box_h / 2 )) ;;
+          6) IFS= tty_read -rsn1 -t 0.02 _ || true; scroll=$(( scroll + box_h / 2 )) ;;
+        esac
+      fi
+      continue
+    fi
+
+    case "$key" in
+      k|K) scroll=$(( scroll - 1 )) ;;
+      " ") scroll=$(( scroll + box_h / 2 )) ;;
+      l|L)
+        if [ "$UI_LANG" = "de" ]; then UI_LANG="en"; else UI_LANG="de"; fi
+        load_menu_texts 2>/dev/null || true
         ;;
-      *)
-        printf '\n%sDisclaimer not accepted. Exiting without changes.%s\n' "$Y" "$N"
+      ""|j|J|y|Y)
+        clear
+        if [ "$UI_LANG" = "en" ]; then
+          alog "Legal disclaimer accepted by user ($(id -un))."
+          printf '%sDisclaimer accepted. Starting system audit ...%s\n\n' "$G" "$N"
+        else
+          alog "Haftungsausschluss vom Benutzer ($(id -un)) akzeptiert."
+          printf '%sHaftungsausschluss akzeptiert. Starte Systemprüfung ...%s\n\n' "$G" "$N"
+        fi
+        break
+        ;;
+      q|Q)
+        clear
+        if [ "$UI_LANG" = "en" ]; then
+          printf '\n%sDisclaimer not accepted. Exiting without changes.%s\n' "$Y" "$N"
+        else
+          printf '\n%sHaftungsausschluss nicht akzeptiert. Skript wird ohne Änderungen beendet.%s\n' "$Y" "$N"
+        fi
         exit 1
         ;;
     esac
-  else
-    cat <<EOF
-${B}${R}================================================================================
-       WICHTIGER RECHTLICHER HINWEIS & HAFTUNGSAUSSCHLUSS (DISCLAIMER)
-================================================================================${N}
-
-Dieses Skript (${B}php2shell-check.sh v${VERSION}${N}) dient der Sicherheitsanalyse sowie der
-unterstützten Eindämmung und Behebung der Schwachstellen ${B}CVE-2026-109618${N} und
-${B}CVE-2026-109619 ("PHP2Shell")${N}.
-
-${B}1. Bereitstellung ohne Gewähr ("AS IS") & Eigenverantwortung${N}
-Die Bereitstellung und Nutzung dieses Skripts erfolgt unentgeltlich und auf
-alleinige Gefahr sowie in voller Eigenverantwortung des Anwenders/Betreibers.
-Es wird keinerlei Gewährleistung für Richtigkeit, Vollständigkeit, Aktualität,
-Fehlerfreiheit oder die Eignung für einen bestimmten Zweck übernommen.
-
-${B}2. Keine Garantie auf Erkennung oder vollständigen Schutz${N}
-Ein Scan ohne Treffer ("0 CRIT / 0 WARN") ist KEIN Beweis dafür, dass das
-System nicht kompromittiert wurde. Ebenso ersetzen temporäre Workarounds laut
-BSI (BITS-H Nr. 2026-297981-1132) keinen Patch.
-
-${B}3. Systemeingriffe, Rückabwicklung & Betriebsrisiken${N}
-Der initiale Scan arbeitet rein lesend. Wenn Sie im anschließenden TUI-Menü
-jedoch aktiv Maßnahmen aktivieren oder deaktivieren (z. B. Paket-Updates,
-PHP-Branch-Wechsel, Docker-Compose-Stopp/Recreate, Konfigurationsänderungen,
-Quarantäne oder deren Rückabwicklung), greift das Skript tief in das laufende
-System ein. Trotz integrierter Backups und Rollback-Mechanismen kann es zu
-Dienstunterbrechungen, Inkompatibilitäten oder Datenverlust kommen.
-
-${B}4. Haftungsbeschränkung (gemäß deutschem Recht, §§ 521, 599, 276 BGB)${N}
-Jegliche Haftung der Autoren, Bereitsteller oder Mitwirkenden für direkte oder
-indirekte Schäden, Folgeschäden, Datenverlust, Systemausfälle oder entgangenen
-Gewinn ist ausgeschlossen, soweit diese nicht auf Vorsatz oder grober
-Fahrlässigkeit beruhen oder eine zwingende gesetzliche Haftung wegen der
-Verletzung des Lebens, des Körpers oder der Gesundheit besteht.
-
-${B}5. Autorisierung${N}
-Sie bestätigen, dass Sie berechtigt sind, dieses System zu prüfen und ggf.
-administrativ zu verändern, und dass aktuelle externe Backups vorliegen.
-${R}================================================================================${N}
-EOF
-    local ans
-    printf '\nBitte tippen Sie exakt %sICH AKZEPTIERE%s (oder %sJA%s), um den Haftungsausschluss\nanzuerkennen und das Skript in Eigenverantwortung zu starten (alles andere bricht ab):\n> ' "$B$G" "$N" "$B$G" "$N"
-    tty_read -r ans || exit 1
-    case "$ans" in
-      "ICH AKZEPTIERE"|"ich akzeptiere"|"JA"|"ja"|"I ACCEPT"|"i accept"|"YES"|"yes")
-        alog "Haftungsausschluss vom Benutzer ($(id -un)) akzeptiert."
-        printf '%sHaftungsausschluss akzeptiert. Starte Systemprüfung ...%s\n\n' "$G" "$N"
-        ;;
-      *)
-        printf '\n%sHaftungsausschluss nicht akzeptiert. Skript wird ohne Änderungen beendet.%s\n' "$Y" "$N"
-        exit 1
-        ;;
-    esac
-  fi
+  done
 }
 
 # ---------------------------------------------------------------- Versionslogik
@@ -2717,6 +2795,342 @@ act_undo() {
   if confirm "PHP-/Webserver-Dienste jetzt direkt neu starten (Maßnahme 10)?"; then act_restart; fi
 }
 
+# --- Maßnahme 17: ClamAV Malwareschutz (Echtzeit clamd+clamonacc vs. Zeitplan/Cronjob) ---
+
+CLAMAV_MODE="${CLAMAV_MODE:-}"                   # live | cron | none (leer = Vorschlag nach Arbeitsspeicher)
+CLAMAV_LIVE_MIN_MB="${CLAMAV_LIVE_MIN_MB:-3500}" # Schwellenwert (MB frei) fuer Echtzeit-Vorschlag (clamd + clamonacc)
+CLAMAV_CRON_MIN_MB="${CLAMAV_CRON_MIN_MB:-1800}" # Schwellenwert (MB frei) fuer Zeitplan-/Cronjob-Scan
+CLAM_MODE_WANT=""
+CLAM_MODE_CUR="none"
+CLAM_REC="none"
+CLAM_REC_WHY=""
+CLAM_RAM_TXT=""
+CLAM_EFF_MB=0
+
+mem_mb() {
+  awk -v k="$1:" '$1==k {printf "%d", $2/1024; f=1; exit} END{if(!f) print 0}' /proc/meminfo 2>/dev/null
+}
+
+clam_rss_mb() {
+  ps -C clamd -o rss= 2>/dev/null | awk '{s+=$1} END{printf "%d", s/1024}'
+}
+
+clam_recommend() {
+  local tot avail swap rss eff
+  tot="$(mem_mb MemTotal)"
+  avail="$(mem_mb MemAvailable)"
+  swap="$(mem_mb SwapTotal)"
+  rss="$(clam_rss_mb)"
+  eff=$(( avail + ${rss:-0} ))
+  CLAM_EFF_MB="$eff"
+
+  if [ "$UI_LANG" = "en" ]; then
+    CLAM_RAM_TXT="Total RAM ${tot} MB, effectively available ~${eff} MB (incl. running clamd), Swap ${swap} MB"
+    if [ "$eff" -ge "$CLAMAV_LIVE_MIN_MB" ]; then
+      CLAM_REC="live"
+      CLAM_REC_WHY="${eff} MB available (real-time threshold: ${CLAMAV_LIVE_MIN_MB} MB). Continuous clamd + On-Access daemon (~1.5 GB RAM, briefly more during signature reload) fits comfortably."
+    elif [ "$eff" -ge "$CLAMAV_CRON_MIN_MB" ]; then
+      CLAM_REC="cron"
+      CLAM_REC_WHY="${eff} MB available: sufficient for a scheduled daily scan (~1.5 GB only during scan run), but too tight for continuous real-time daemon (threshold ${CLAMAV_LIVE_MIN_MB} MB)."
+    elif [ $(( eff + swap )) -ge "$CLAMAV_CRON_MIN_MB" ]; then
+      CLAM_REC="cron"
+      CLAM_REC_WHY="Only ${eff} MB RAM free - combined with Swap (${swap} MB) it is just enough for a nightly cron/timer scan. Real-time daemon would risk OOM."
+    else
+      CLAM_REC="none"
+      CLAM_REC_WHY="Only ${eff} MB RAM free (Swap ${swap} MB): even a scheduled scan (~1.5 GB) could cause out-of-memory issues on this host."
+    fi
+  else
+    CLAM_RAM_TXT="Arbeitsspeicher gesamt ${tot} MB, frei nutzbar ca. ${eff} MB (inkl. laufendem clamd), Swap ${swap} MB"
+    if [ "$eff" -ge "$CLAMAV_LIVE_MIN_MB" ]; then
+      CLAM_REC="live"
+      CLAM_REC_WHY="Es sind ${eff} MB frei (Schwelle fuer Echtzeit: ${CLAMAV_LIVE_MIN_MB} MB). Der Dauerbetrieb von clamd + On-Access (ca. 1,5 GB RAM, beim Signatur-Reload kurzzeitig mehr) passt problemlos."
+    elif [ "$eff" -ge "$CLAMAV_CRON_MIN_MB" ]; then
+      CLAM_REC="cron"
+      CLAM_REC_WHY="Es sind ${eff} MB frei: genug fuer einen geplanten Scan per Cron/Timer (ca. 1,5 GB nur waehrend des Laufs), aber zu knapp fuer den Echtzeit-Daemon (Schwelle ${CLAMAV_LIVE_MIN_MB} MB)."
+    elif [ $(( eff + swap )) -ge "$CLAMAV_CRON_MIN_MB" ]; then
+      CLAM_REC="cron"
+      CLAM_REC_WHY="Nur ${eff} MB RAM frei - zusammen mit Swap (${swap} MB) reicht es knapp fuer einen naechtlichen Cron-/Timer-Scan. Echtzeit waere zu viel."
+    else
+      CLAM_REC="none"
+      CLAM_REC_WHY="Nur ${eff} MB RAM frei (Swap ${swap} MB): schon ein einzelner Scan (ca. 1,5 GB) wuerde den Server in Speichernot (OOM) bringen."
+    fi
+  fi
+}
+
+clam_mode_detect() {
+  CLAM_MODE_CUR="none"
+  command -v clamscan >/dev/null 2>&1 || return 0
+  if systemctl is-active --quiet clamav-daemon 2>/dev/null && { systemctl is-active --quiet clamav-clamonacc 2>/dev/null || systemctl is-active --quiet clamav-onacc 2>/dev/null; }; then
+    CLAM_MODE_CUR="live"
+  elif systemctl is-enabled --quiet clamav-scan.timer 2>/dev/null || [ -f /etc/cron.d/clamav-scan ] || [ -x /usr/local/sbin/clamav-scan.sh ]; then
+    CLAM_MODE_CUR="cron"
+  fi
+}
+
+clam_write_scan_script() {
+  mkdir -p /var/log/clamav 2>/dev/null || true
+  cat > /usr/local/sbin/clamav-scan.sh << 'CLS_EOF'
+#!/usr/bin/env bash
+# IT-Reinbek: geplanter ClamAV-Scan fuer Webroots & Systempfade (ohne Dauer-Daemon).
+# Exit 0 = sauber, 1 = Fund, 2 = Fehler.
+set -uo pipefail
+LOG=/var/log/clamav/scan.log
+FOUND=/var/log/clamav/last-infected.txt
+OKSTAMP=/var/log/clamav/last-scan-ok
+
+PATHS=()
+for p in /var/www /home /root /opt /srv /tmp /var/tmp /var/lib/docker/volumes; do
+  [ -d "$p" ] && PATHS+=("$p")
+done
+[ "${#PATHS[@]}" -gt 0 ] || exit 0
+
+mkdir -p /var/log/clamav 2>/dev/null || true
+echo "=== $(date -Is) Scan-Start ===" >> "$LOG"
+TMP="$(mktemp)"
+clamscan --recursive --infected \
+  --max-filesize=100M --max-scansize=300M \
+  --exclude-dir='/var/lib/docker/volumes/[^/]*(mysql|mariadb|postgres|redis)' \
+  --log="$LOG" "${PATHS[@]}" > "$TMP" 2>&1
+rc=$?
+
+case "$rc" in
+  0)
+    date -Is > "$OKSTAMP"
+    rm -f "$FOUND" "$TMP"
+    exit 0
+    ;;
+  1)
+    mv "$TMP" "$FOUND"
+    chmod 640 "$FOUND"
+    logger -p auth.crit -t clamav-scan "INFECTED FILES FOUND - siehe $FOUND"
+    exit 1
+    ;;
+  *)
+    logger -p auth.err -t clamav-scan "clamscan Fehler (Exit $rc) - siehe $LOG"
+    rm -f "$TMP"
+    exit 2
+    ;;
+esac
+CLS_EOF
+  chmod 750 /usr/local/sbin/clamav-scan.sh
+}
+
+clam_setup_cron() {
+  clam_write_scan_script
+  cat > /etc/systemd/system/clamav-scan.service << 'CSS_EOF'
+[Unit]
+Description=ClamAV Zeitplan-Scan (IT-Reinbek PHP2Shell)
+After=clamav-freshclam.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/clamav-scan.sh
+Nice=19
+IOSchedulingClass=idle
+MemoryMax=2500M
+TimeoutStartSec=4h
+CSS_EOF
+  cat > /etc/systemd/system/clamav-scan.timer << 'CST_EOF'
+[Unit]
+Description=Taeglicher ClamAV-Scan (IT-Reinbek PHP2Shell)
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+CST_EOF
+  cat > /etc/logrotate.d/clamav-scan << 'CSL_EOF'
+/var/log/clamav/scan.log {
+    weekly
+    rotate 8
+    compress
+    missingok
+    notifempty
+}
+CSL_EOF
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    rm -f /etc/cron.d/clamav-scan
+    systemctl daemon-reload
+    systemctl enable --now clamav-scan.timer >/dev/null 2>&1 || warn "clamav-scan.timer konnte nicht aktiviert werden."
+  else
+    cat > /etc/cron.d/clamav-scan << 'CSC_EOF'
+# IT-Reinbek: Taeglicher ClamAV-Scan um 03:30 Uhr
+30 3 * * * root /usr/local/sbin/clamav-scan.sh >/dev/null 2>&1
+CSC_EOF
+    chmod 644 /etc/cron.d/clamav-scan
+  fi
+  ok "ClamAV Zeitplan-/Cronjob-Scan eingerichtet (täglich 03:30 Uhr, Skript: /usr/local/sbin/clamav-scan.sh)."
+  info "Erster Test-Scan jederzeit möglich mit: sudo systemctl start clamav-scan.service (Log: /var/log/clamav/scan.log)"
+}
+
+clam_stop_cron() {
+  systemctl disable --now clamav-scan.timer >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/clamav-scan.timer /etc/systemd/system/clamav-scan.service /etc/logrotate.d/clamav-scan /etc/cron.d/clamav-scan /usr/local/sbin/clamav-scan.sh
+  command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload 2>/dev/null || true
+}
+
+clam_setup_live() {
+  local d clamonacc onacc_unit conf="/etc/clamav/clamd.conf"
+  [ ! -f "$conf" ] && [ -f /etc/clamd.d/scan.conf ] && conf="/etc/clamd.d/scan.conf"
+
+  if [ -f "$conf" ] && ! grep -qsE '^OnAccessIncludePath' "$conf"; then
+    [ -f "${conf}.bak-php2shell" ] || cp -a "$conf" "${conf}.bak-php2shell"
+    {
+      echo ""
+      echo "# --- IT-Reinbek PHP2Shell On-Access (nur Benachrichtigung/Log, blockiert nichts) ---"
+      for d in /var/www /home /opt /srv; do
+        if [ -d "$d" ]; then echo "OnAccessIncludePath $d"; fi
+      done
+      for d in "${WEBROOTS[@]:-}"; do
+        if [ -n "$d" ] && [ -d "$d" ]; then
+          case "$d" in /var/www*|/home*|/opt*|/srv*) ;; *) echo "OnAccessIncludePath $d" ;; esac
+        fi
+      done
+      echo "OnAccessExcludeUname clamav"
+      echo "OnAccessPrevention no"
+      echo "OnAccessExtraScanning yes"
+    } >> "$conf"
+  fi
+
+  systemctl enable clamav-daemon >/dev/null 2>&1 || true
+  systemctl restart clamav-daemon || warn "clamav-daemon Start fehlgeschlagen: journalctl -u clamav-daemon -n 30"
+
+  clamonacc="$(command -v clamonacc || echo /usr/sbin/clamonacc)"
+  mkdir -p /var/log/clamav 2>/dev/null || true
+  if systemctl cat clamav-clamonacc.service >/dev/null 2>&1; then
+    install -d /etc/systemd/system/clamav-clamonacc.service.d
+    cat > /etc/systemd/system/clamav-clamonacc.service.d/override.conf << ONACC_EOF
+[Service]
+ExecStartPre=
+ExecStartPre=/bin/bash -c 'for i in {1..60}; do [ -S /run/clamav/clamd.ctl ] || [ -S /var/run/clamav/clamd.ctl ] && exit 0; sleep 1; done; exit 1'
+ExecStart=
+ExecStart=${clamonacc} -F --fdpass --log=/var/log/clamav/clamonacc.log
+ONACC_EOF
+    onacc_unit="clamav-clamonacc"
+    if [ -f /etc/systemd/system/clamav-onacc.service ]; then
+      systemctl disable --now clamav-onacc >/dev/null 2>&1 || true
+      mv -f /etc/systemd/system/clamav-onacc.service /etc/systemd/system/clamav-onacc.service.bak-php2shell
+    fi
+  else
+    cat > /etc/systemd/system/clamav-onacc.service << ONACC2_EOF
+[Unit]
+Description=ClamAV On-Access Scanner (Echtzeitueberwachung IT-Reinbek)
+Requires=clamav-daemon.service
+After=clamav-daemon.service
+
+[Service]
+Type=simple
+ExecStartPre=/bin/bash -c 'for i in {1..60}; do [ -S /run/clamav/clamd.ctl ] || [ -S /var/run/clamav/clamd.ctl ] && exit 0; sleep 1; done; exit 1'
+ExecStart=${clamonacc} -F --fdpass --log=/var/log/clamav/clamonacc.log
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+ONACC2_EOF
+    onacc_unit="clamav-onacc"
+  fi
+  systemctl daemon-reload
+  systemctl enable "$onacc_unit" >/dev/null 2>&1 || true
+  systemctl restart "$onacc_unit" || warn "$onacc_unit nicht gestartet (journalctl -u $onacc_unit -n 30)."
+  ok "ClamAV Echtzeit-Überwachung (clamd + $onacc_unit On-Access) aktiviert."
+}
+
+clam_stop_live() {
+  local u
+  for u in clamav-clamonacc clamav-onacc clamav-daemon clamav-daemon.socket; do
+    systemctl disable --now "$u" >/dev/null 2>&1 || true
+  done
+  rm -rf /etc/systemd/system/clamav-clamonacc.service.d
+  rm -f /etc/systemd/system/clamav-onacc.service
+  command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload 2>/dev/null || true
+}
+
+act_clamav() {
+  clam_recommend
+  clam_mode_detect
+  local mode="${CLAM_MODE_WANT:-${CLAMAV_MODE:-}}"
+  if [ -z "$mode" ] || [ "$mode" = "none" ]; then
+    mode="$CLAM_REC"
+    [ "$mode" = "none" ] && mode="cron"
+  fi
+
+  local mode_label
+  if [ "$mode" = "live" ]; then
+    mode_label="Echtzeit-Überwachung (clamd + clamonacc On-Access)"
+  else
+    mode_label="Zeitplan / Cronjob (täglicher Scan um 03:30 Uhr, ohne Dauer-Daemon)"
+  fi
+
+  explain "Maßnahme #17: ClamAV Malwareschutz einrichten ($mode_label)" "niedrig-mittel" \
+    "Installiert bei Bedarf ClamAV, aktualisiert die Signaturen (freshclam) und richtet die gewählte Betriebsart '$mode' ein ($CLAM_RAM_TXT)." \
+    "Echtzeit (live) benötigt dauerhaft ca. 1,5 GB RAM; Zeitplan/Cronjob (cron) belegt den Speicher nur kurz nachts während des Scans." \
+    "Checkbox [17] abwählen oder im ClamAV-Dialog 'Kein ClamAV' wählen"
+
+  local i fresh_ok=0
+  if command -v apt-get >/dev/null 2>&1; then
+    local pk="clamav clamav-freshclam"
+    [ "$mode" = "live" ] && pk="clamav clamav-daemon clamav-freshclam"
+    info "Installiere/prüfe Pakete: $pk ..."
+    apt-get update -qq 2>/dev/null || true
+    # shellcheck disable=SC2086
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confold $pk; then
+      crit "Paketinstallation ($pk) fehlgeschlagen."
+      return 1
+    fi
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y clamav clamd clamav-update || return 1
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y clamav clamd clamav-update || return 1
+  elif ! command -v clamscan >/dev/null 2>&1; then
+    crit "ClamAV ist nicht installiert und kein unterstützter Paketmanager (apt/dnf/yum) wurde gefunden."
+    return 1
+  fi
+
+  systemctl stop clamav-freshclam 2>/dev/null || true
+  info "Aktualisiere ClamAV-Virensignaturen (freshclam) ..."
+  for i in 1 2 3; do
+    if freshclam >/dev/null 2>&1; then fresh_ok=1; break; fi
+    sleep 3
+  done
+  [ "$fresh_ok" -ne 1 ] && warn "freshclam-Update meldete keinen direkten Erfolg (läuft ggf. bereits über Dienst)."
+  systemctl enable --now clamav-freshclam >/dev/null 2>&1 || warn "clamav-freshclam konnte nicht gestartet werden."
+
+  case "$mode" in
+    live)
+      clam_stop_cron
+      clam_setup_live
+      ;;
+    cron)
+      clam_stop_live
+      clam_setup_cron
+      ;;
+  esac
+  CLAM_MODE_CUR="$mode"
+  CLAM_MODE_WANT="$mode"
+  alog "ClamAV eingerichtet in Betriebsart: $mode"
+}
+
+undo_clamav() {
+  explain "Rückabwicklung #17: ClamAV Echtzeit- & Cronjob-Überwachung deaktivieren" "niedrig" \
+    "Stoppt und deaktiviert clamd, clamonacc sowie den täglichen clamav-scan.timer/Cronjob und stellt clamd.conf wieder her (Pakete bleiben installiert)." \
+    "Es findet keine automatische ClamAV-Überwachung auf Webshells/Malware mehr statt." \
+    "Checkbox [17] wieder aktivieren"
+  confirm "ClamAV-Dienste und Zeitplan-Scans jetzt deaktivieren?" || return 0
+  clam_stop_live
+  clam_stop_cron
+  systemctl disable --now clamav-freshclam >/dev/null 2>&1 || true
+  if [ -f /etc/clamav/clamd.conf.bak-php2shell ]; then
+    cp -a /etc/clamav/clamd.conf.bak-php2shell /etc/clamav/clamd.conf
+  fi
+  CLAM_MODE_CUR="none"
+  CLAM_MODE_WANT="none"
+  ok "ClamAV gestoppt und deaktiviert (Pakete bleiben installiert)."
+  alog "Rückabwicklung #17: ClamAV deaktiviert"
+}
+
 # ======================================================= Checkliste, Scan-Report & Drucker-Erkennung
 
 generate_checklist_text() {
@@ -2926,7 +3340,7 @@ declare -a M_TITLE=() M_CAT=() M_RISK=() M_WHAT=() M_IMPACT=() M_UNDO=() M_ACTIV
 
 detect_live_states() {
   local i pf
-  for i in {1..16}; do M_ACTIVE[$i]=0; done
+  for i in {1..17}; do M_ACTIVE[$i]=0; done
 
   ls -d /root/php2shell-evidence-* >/dev/null 2>&1 && M_ACTIVE[1]=1
   ls -d /root/php2shell-backup-* >/dev/null 2>&1 && M_ACTIVE[2]=1
@@ -2956,17 +3370,54 @@ detect_live_states() {
   M_ACTIVE[14]=0
   ls /root/php2shell-checkliste-*.txt /root/php2shell-revisionsbericht-*.txt >/dev/null 2>&1 && M_ACTIVE[15]=1
   M_ACTIVE[16]=0
+
+  clam_recommend
+  clam_mode_detect
+  if [ "$CLAM_MODE_CUR" = "live" ] || [ "$CLAM_MODE_CUR" = "cron" ]; then
+    M_ACTIVE[17]=1
+    [ -z "$CLAM_MODE_WANT" ] && CLAM_MODE_WANT="$CLAM_MODE_CUR"
+  else
+    [ -z "$CLAM_MODE_WANT" ] && CLAM_MODE_WANT="$CLAM_REC"
+  fi
 }
 
 sync_selection_with_active() {
   local i
   detect_live_states
-  for i in {1..16}; do
+  for i in {1..17}; do
     M_SEL[$i]="${M_ACTIVE[$i]}"
   done
+  load_menu_texts 2>/dev/null || true
 }
 
 load_menu_texts() {
+  clam_recommend
+  clam_mode_detect
+  local clam_mode_lbl clam_rec_lbl
+  if [ "$UI_LANG" = "en" ]; then
+    case "${CLAM_MODE_WANT:-$CLAM_MODE_CUR}" in
+      live) clam_mode_lbl="Real-time (clamd)" ;;
+      cron) clam_mode_lbl="Cronjob/Timer" ;;
+      *)    clam_mode_lbl="Configure" ;;
+    esac
+    case "$CLAM_REC" in
+      live) clam_rec_lbl="Real-time (live)" ;;
+      cron) clam_rec_lbl="Scheduled/Cron (cron)" ;;
+      *)    clam_rec_lbl="No ClamAV (low RAM)" ;;
+    esac
+  else
+    case "${CLAM_MODE_WANT:-$CLAM_MODE_CUR}" in
+      live) clam_mode_lbl="Echtzeit (clamd)" ;;
+      cron) clam_mode_lbl="Cronjob/Timer" ;;
+      *)    clam_mode_lbl="Konfigurieren" ;;
+    esac
+    case "$CLAM_REC" in
+      live) clam_rec_lbl="Echtzeit (live)" ;;
+      cron) clam_rec_lbl="Zeitplan/Cronjob (cron)" ;;
+      *)    clam_rec_lbl="Kein ClamAV (wenig RAM)" ;;
+    esac
+  fi
+
   if [ "$UI_LANG" = "en" ]; then
     M_CAT[1]="I. Forensics & Backup"; M_TITLE[1]="Capture evidence (Logs/RAM/Locks)"
     M_RISK[1]="NO CHANGE (read-only, creates folder in /root)"
@@ -3063,6 +3514,12 @@ load_menu_texts() {
     M_WHAT[16]="Re-runs the PHP version and backport check (host & Docker containers) to immediately verify after an update that all installations report GREEN (SAFE)."
     M_IMPACT[16]="Zero impact on operations."
     M_UNDO[16]="Not required (read-only)."
+
+    M_CAT[17]="IV. Cleanup & Print"; M_TITLE[17]="ClamAV protection ($clam_mode_lbl)"
+    M_RISK[17]="LOW-MEDIUM (report-only On-Access or nightly Cron/Timer)"
+    M_WHAT[17]="Configures ClamAV malware/webshell scanning in either Real-time mode (clamd + clamonacc On-Access for /var/www, /home, /opt, /srv) or Scheduled Cron/Timer mode (03:30 daily without resident daemon). Press [Space] or [c] to open the mode selector!"
+    M_IMPACT[17]="${CLAM_RAM_TXT}. RAM-based recommendation: ${clam_rec_lbl} (${CLAM_REC_WHY})"
+    M_UNDO[17]="Uncheck [x] -> [ ] (or choose 'No ClamAV' in dialog) and press [Enter]: Stops and disables clamd, clamonacc, and clamav-scan.timer."
   else
     M_CAT[1]="I. Forensik & Sicherung"; M_TITLE[1]="Beweise sichern (Logs/RAM/Locks)"
     M_RISK[1]="KEINE ÄNDERUNG (nur lesend, legt Ordner in /root an)"
@@ -3159,17 +3616,22 @@ load_menu_texts() {
     M_WHAT[16]="Führt die PHP-Versions- und Backport-Prüfung (Host & Docker-Container) erneut aus, um nach einem Update sofort zu kontrollieren, ob alle Installationen auf GRÜN (SICHER) stehen."
     M_IMPACT[16]="Keine Auswirkung auf den Betrieb."
     M_UNDO[16]="Nicht erforderlich (rein lesend)."
+
+    M_CAT[17]="IV. Bereinigung & Druck"; M_TITLE[17]="ClamAV Malwareschutz ($clam_mode_lbl)"
+    M_RISK[17]="NIEDRIG-MITTEL (On-Access nur meldend od. Cronjob nachts)"
+    M_WHAT[17]="Richtet ClamAV-Malware-/Webshell-Überwachung wahlweise in Echtzeit (clamd + clamonacc On-Access für /var/www, /home, /opt, /srv) oder als täglichen Cronjob/Timer (03:30 Uhr ohne Dauer-Daemon) ein. Mit [Leertaste] oder [c] Betriebsart wählen!"
+    M_IMPACT[17]="${CLAM_RAM_TXT}. Vorschlag nach RAM: ${clam_rec_lbl} (${CLAM_REC_WHY})"
+    M_UNDO[17]="Haken [x] -> [ ] abwählen (oder im Dialog 'Kein ClamAV' wählen) und [Enter] drücken: Stoppt und deaktiviert clamd, clamonacc und clamav-scan.timer."
   fi
 }
 
 init_menu_data() {
   local i
-  for i in {1..16}; do M_REVERSIBLE[$i]=1; done
+  for i in {1..17}; do M_REVERSIBLE[$i]=1; done
   M_REVERSIBLE[10]=0
   M_REVERSIBLE[14]=0
   M_REVERSIBLE[16]=0
 
-  load_menu_texts
   sync_selection_with_active
 }
 
@@ -3191,6 +3653,7 @@ apply_action_by_id() {
     14) act_undo ;;
     15) act_rotate ;;
     16) bash "$SELF" --versions-only --no-menu --accept-disclaimer 2>&1 | sed -n '/1) PHP-Versionen/,/Zusammenfassung/p' ;;
+    17) act_clamav ;;
   esac
 }
 
@@ -3212,16 +3675,497 @@ revert_action_by_id() {
     14) info "Punkt #14 ist bereits die Sammel-Rückabwicklung." ;;
     15) undo_rotate ;;
     16) info "Ein lesender Scan (#16) bedarf keiner Rückabwicklung." ;;
+    17) undo_clamav ;;
   esac
 }
 
+tui_clamav_screen() {
+  clam_recommend
+  clam_mode_detect
+  local sel=1 iscroll=0 key k2 k3
+  if [ "$CLAM_MODE_WANT" = "live" ]; then sel=1
+  elif [ "$CLAM_MODE_WANT" = "cron" ]; then sel=2
+  elif [ "$CLAM_MODE_WANT" = "none" ] && [ "${M_SEL[17]:-0}" -eq 0 ] && [ "$CLAM_MODE_CUR" != "none" ]; then sel=3
+  elif [ "$CLAM_REC" = "live" ]; then sel=1
+  elif [ "$CLAM_REC" = "cron" ]; then sel=2
+  else sel=2
+  fi
+
+  local chosen="$sel"
+  while true; do
+    clam_recommend
+    clam_mode_detect
+    local cols rows lw rw box_h r_inner
+    cols=$(tput cols 2>/dev/null || echo 118)
+    rows=$(tput lines 2>/dev/null || echo 34)
+    [ "$cols" -lt 96 ] && cols=96
+    [ "$rows" -lt 24 ] && rows=24
+    lw=$(( cols * 46 / 100 ))
+    [ "$lw" -lt 44 ] && lw=44
+    [ "$lw" -gt 62 ] && lw=62
+    rw=$(( cols - lw - 4 ))
+    [ "$rw" -lt 36 ] && rw=36
+    box_h=$(( rows - 6 ))
+    [ "$box_h" -lt 16 ] && box_h=16
+    r_inner=$(( rw - 2 ))
+
+    local step_title l_box_title r_box_title intro_line status_line key_line
+    local -a opt_title=() opt_badge=() opt_info=()
+    local common_info
+
+    if [ "$UI_LANG" = "en" ]; then
+      step_title="Step 3b - ClamAV Operating Mode "
+      l_box_title="ClamAV Operating Mode"
+      r_box_title="Info & RAM Recommendation"
+      intro_line=" ${CLAM_RAM_TXT}. Suggestion: ${CLAM_REC}. Choose mode with Space/Enter."
+      status_line=" Select ClamAV mode (1=Real-time clamd+On-Access, 2=Daily Cron/Timer scan, 3=Disable/None) and press [Enter]."
+      key_line=" Up/Down: select | Space/Enter: confirm mode | PgUp/PgDn: scroll Info | l: DE/EN | b/q: Back to Menu"
+
+      common_info=$(printf 'RAM ANALYSIS & RECOMMENDATION:\n%s.\n\nRECOMMENDED MODE: %s\n%s\n\nThresholds (customizable via CLAMAV_LIVE_MIN_MB=%d / CLAMAV_CRON_MIN_MB=%d):\n- Real-time (live): >= %d MB free RAM\n- Scheduled/Cron (cron): >= %d MB free RAM\nYou can switch the operating mode at any time.' \
+        "$CLAM_RAM_TXT" "$CLAM_REC" "$CLAM_REC_WHY" "$CLAMAV_LIVE_MIN_MB" "$CLAMAV_CRON_MIN_MB" "$CLAMAV_LIVE_MIN_MB" "$CLAMAV_CRON_MIN_MB")
+
+      opt_title[1]="Real-time (clamd + On-Access)"
+      opt_title[2]="Scheduled / Cronjob (daily 03:30)"
+      opt_title[3]="No ClamAV (disable / rollback)"
+
+      opt_info[1]=$(printf 'MODE 1: REAL-TIME MONITORING (clamd + clamonacc On-Access)\n\nWHAT DOES THIS MODE DO?\nclamd runs continuously as a background daemon and monitors /var/www, /home, /opt, /srv in real time via clamonacc (--fdpass). Detections are logged immediately to /var/log/clamav/clamonacc.log (OnAccessPrevention=no, so web traffic is never blocked).\n\nRAM REQUIREMENT:\nRequires ~1.5 GB RAM permanently (briefly more during signature reloads).\n\n%s' "$common_info")
+      opt_info[2]=$(printf 'MODE 2: SCHEDULED / CRONJOB SCAN (daily at 03:30, no daemon)\n\nWHAT DOES THIS MODE DO?\nSets up /usr/local/sbin/clamav-scan.sh via systemd timer (clamav-scan.timer) or /etc/cron.d/clamav-scan at 03:30 with low CPU/IO priority (Nice=19, Idle IO, MemoryMax=2500M). Scans /var/www, /home, /root, /opt, /srv, /tmp, /var/tmp, and Docker volumes.\n\nRAM REQUIREMENT:\nZero RAM usage during normal daytime operation! The ~1.5 GB signature memory is only used during the nightly scan.\n\n%s' "$common_info")
+      opt_info[3]=$(printf 'MODE 3: NO CLAMAV (DISABLE / ROLLBACK)\n\nWHAT DOES THIS MODE DO?\nIf ClamAV is currently active (real-time or cronjob), it will be stopped and disabled on [Enter] in the main menu (packages remain installed). Recommended for servers with very low available RAM.\n\n%s' "$common_info")
+    else
+      step_title="Schritt 3b - ClamAV Betriebsart "
+      l_box_title="ClamAV Betriebsart"
+      r_box_title="Info & RAM-Empfehlung"
+      intro_line=" ${CLAM_RAM_TXT}. Vorschlag: ${CLAM_REC}. Waehlen Sie mit Leertaste/Enter."
+      status_line=" ClamAV-Betriebsart waehlen (1=Echtzeit clamd+On-Access, 2=Zeitplan/Cronjob nachts, 3=Kein ClamAV) & [Enter] druecken."
+      key_line=" Pfeile: Wahl | Leertaste/Enter: Uebernehmen | Bild^/v: Info | l: DE/EN | b/q: Zurueck zum Menue"
+
+      common_info=$(printf 'RAM-ANALYSE & EMPFEHLUNG:\n%s.\n\nVORSCHLAG: %s\n%s\n\nSchwellenwerte (anpassbar per CLAMAV_LIVE_MIN_MB=%d / CLAMAV_CRON_MIN_MB=%d):\n- Echtzeit (live): ab %d MB frei\n- Zeitplan/Cronjob (cron): ab %d MB frei\nDie Empfehlung ist ein Vorschlag - Sie koennen die Betriebsart jederzeit frei waehlen oder umstellen.' \
+        "$CLAM_RAM_TXT" "$CLAM_REC" "$CLAM_REC_WHY" "$CLAMAV_LIVE_MIN_MB" "$CLAMAV_CRON_MIN_MB" "$CLAMAV_LIVE_MIN_MB" "$CLAMAV_CRON_MIN_MB")
+
+      opt_title[1]="Echtzeit (clamd + On-Access)"
+      opt_title[2]="Zeitplan / Cronjob (taegl. 03:30)"
+      opt_title[3]="Kein ClamAV (Deaktivieren)"
+
+      opt_info[1]=$(printf 'MODUS 1: ECHTZEIT-UEBERWACHUNG (clamd + clamonacc On-Access)\n\nWAS MACHT DIESE BETRIEBSART?\nclamd laeuft dauerhaft als Dienst und ueberwacht /var/www, /home, /opt, /srv in Echtzeit per clamonacc (--fdpass). Neue Webshells oder Backdoors werden sofort beim Anlegen erkannt und in /var/log/clamav/clamonacc.log gemeldet (OnAccessPrevention=no, blockiert den Webbetrieb nicht).\n\nSPEICHERBEDARF (RAM):\nBenoetigt dauerhaft ca. 1,5 GB RAM (beim Signatur-Reload kurzzeitig mehr).\n\n%s' "$common_info")
+      opt_info[2]=$(printf 'MODUS 2: ZEITPLAN / CRONJOB (taeglicher Scan um 03:30, ohne Daemon)\n\nWAS MACHT DIESE BETRIEBSART?\nRichtet /usr/local/sbin/clamav-scan.sh per systemd-Timer (clamav-scan.timer) bzw. /etc/cron.d/clamav-scan um 03:30 Uhr mit niedriger Prioritaet (Nice=19, Idle-IO, MemoryMax=2500M) ein. Prueft /var/www, /home, /root, /opt, /srv, /tmp, /var/tmp sowie Docker-Volumes (ohne DB-Volumes).\n\nSPEICHERBEDARF (RAM):\nTagsueber 0 MB Dauer-RAM! Die ca. 1,5 GB RAM werden nur nachts waehrend des Scans belegt.\n\n%s' "$common_info")
+      opt_info[3]=$(printf 'MODUS 3: KEIN CLAMAV (DEAKTIVIEREN / RUECKBAU)\n\nWAS MACHT DIESE BETRIEBSART?\nIst ClamAV bereits eingerichtet (Echtzeit oder Cronjob), werden Dienste und Timer beim Anwenden im Hauptmenue gestoppt und deaktiviert (Pakete bleiben installiert). Sinnvoll bei sehr wenig freiem Arbeitsspeicher.\n\n%s' "$common_info")
+    fi
+
+    local b1="" b2="" b3=""
+    if [ "$UI_LANG" = "en" ]; then
+      [ "$CLAM_REC" = "live" ] && b1="recommended"
+      [ "$CLAM_REC" = "cron" ] && b2="recommended"
+      [ "$CLAM_REC" = "none" ] && b3="recommended"
+      [ "$CLAM_MODE_CUR" = "live" ] && b1="active${b1:+, $b1}"
+      [ "$CLAM_MODE_CUR" = "cron" ] && b2="active${b2:+, $b2}"
+      [ "$CLAM_MODE_CUR" = "none" ] && b3="inactive${b3:+, $b3}"
+    else
+      [ "$CLAM_REC" = "live" ] && b1="empfohlen"
+      [ "$CLAM_REC" = "cron" ] && b2="empfohlen"
+      [ "$CLAM_REC" = "none" ] && b3="empfohlen"
+      [ "$CLAM_MODE_CUR" = "live" ] && b1="aktiv${b1:+, $b1}"
+      [ "$CLAM_MODE_CUR" = "cron" ] && b2="aktiv${b2:+, $b2}"
+      [ "$CLAM_MODE_CUR" = "none" ] && b3="inaktiv${b3:+, $b3}"
+    fi
+    opt_badge[1]="${b1:+[$b1]}"
+    opt_badge[2]="${b2:+[$b2]}"
+    opt_badge[3]="${b3:+[$b3]}"
+
+    local -a rlines=()
+    local rline wline
+    while IFS= read -r rline; do
+      if [ -z "$rline" ]; then
+        rlines+=("")
+      else
+        while IFS= read -r wline; do
+          rlines+=("$wline")
+        done < <(printf '%s\n' "$rline" | fold -s -w "$r_inner")
+      fi
+    done <<< "${opt_info[$sel]}"
+
+    local r_total="${#rlines[@]}"
+    local rmax=$(( r_total - box_h ))
+    [ "$rmax" -lt 0 ] && rmax=0
+    [ "$iscroll" -gt "$rmax" ] && iscroll="$rmax"
+    [ "$iscroll" -lt 0 ] && iscroll=0
+    local r_more_up=0 r_more_dn=0
+    [ "$iscroll" -gt 0 ] && r_more_up=1
+    [ $(( iscroll + box_h )) -lt "$r_total" ] && r_more_dn=1
+
+    local rup_s="" rdn_s=""
+    if [ "$r_more_up" -eq 1 ]; then rup_s=$( [ "$UI_LANG" = "en" ] && echo " ^more " || echo " ^mehr " ); fi
+    if [ "$r_more_dn" -eq 1 ]; then rdn_s=$( [ "$UI_LANG" = "en" ] && echo " PgDn v more " || echo " Bild v mehr " ); fi
+
+    local l_fill_top=$(( lw - ${#l_box_title} - 4 ))
+    [ "$l_fill_top" -lt 1 ] && l_fill_top=1
+    local r_fill_top=$(( rw - ${#r_box_title} - ${#rup_s} - 4 ))
+    [ "$r_fill_top" -lt 1 ] && r_fill_top=1
+
+    printf '\e[H\e[2J'
+    tui_topbar "$cols" " IT-Reinbek PHP2Shell-Auditor v${VERSION}" "$step_title"
+    printf '%s\n' "${intro_line:0:$cols}"
+    printf '%s+-- %s%s%s %s++-- %s%s%s %s%s%s%s+%s\n' \
+      "$C" "$C$B" "$l_box_title" "$N$C" "$(printf '%*s' "$l_fill_top" '' | tr ' ' '-')" \
+      "$C$B" "$r_box_title" "$N$C" "$(printf '%*s' "$r_fill_top" '' | tr ' ' '-')" "$Y" "$rup_s" "$C" "$N"
+
+    local row idx mark item_color badge title max_tlen lstr raw_len pad_len lpad rstr r_pad rfmt
+    for (( row=0; row<box_h; row++ )); do
+      idx=$(( row + 1 ))
+      rstr="${rlines[$(( iscroll + row ))]:-}"
+      if [ "$idx" -le 3 ]; then
+        item_color=""
+        mark=" "
+        if [ "$idx" -eq "$chosen" ]; then
+          if { [ "$idx" -eq 1 ] && [ "$CLAM_MODE_CUR" = "live" ]; } || { [ "$idx" -eq 2 ] && [ "$CLAM_MODE_CUR" = "cron" ]; }; then
+            mark="x"; item_color="$G"
+          elif [ "$idx" -eq 3 ] && [ "$CLAM_MODE_CUR" != "none" ]; then
+            mark="-"; item_color="${R}${B}"
+          else
+            mark="+"; item_color="${Y}${B}"
+          fi
+        fi
+        badge="${opt_badge[$idx]}"
+        title="${opt_title[$idx]}"
+        max_tlen=$(( lw - 12 - ${#badge} ))
+        [ "$max_tlen" -lt 10 ] && max_tlen=10
+        title="${title:0:$max_tlen}"
+        if [ "$idx" -eq "$sel" ]; then
+          lstr=" > [$mark] $idx) $title"
+        else
+          lstr="   [$mark] $idx) $title"
+        fi
+        raw_len=$(( ${#lstr} + ${#badge} + 1 ))
+        pad_len=$(( lw - raw_len ))
+        [ "$pad_len" -lt 1 ] && pad_len=1
+        lstr="${lstr}$(printf '%*s' "$pad_len" '')${badge} "
+        if [ "$idx" -eq "$sel" ]; then
+          if [ -n "$item_color" ]; then
+            lpad=$'\e[7m'"${item_color}${B}${lstr}"$'\e[0m'
+          else
+            lpad=$'\e[7m'"${B}${lstr}"$'\e[0m'
+          fi
+        elif [ -n "$item_color" ]; then
+          lpad="${item_color}${lstr}${N}"
+        else
+          lpad="${lstr}"
+        fi
+      else
+        lpad=$(printf '%*s' "$lw" '')
+      fi
+
+      rstr="${rstr:0:$r_inner}"
+      r_pad=$(( r_inner - ${#rstr} ))
+      [ "$r_pad" -lt 0 ] && r_pad=0
+      case "$rstr" in
+        MODUS*|MODE\ *)
+          rfmt=" ${B}${rstr}${N}$(printf '%*s' "$r_pad" '') " ;;
+        WAS\ MACHT*|SPEICHERBEDARF*|RAM-ANALYSE*|WHAT\ DOES*|RAM\ REQUIREMENT*|RAM\ ANALYSIS*)
+          rfmt=" ${B}${C}${rstr}${N}$(printf '%*s' "$r_pad" '') " ;;
+        VORSCHLAG:*|RECOMMENDED\ MODE:*)
+          rfmt=" ${G}${B}${rstr}${N}$(printf '%*s' "$r_pad" '') " ;;
+        *)
+          rfmt=" ${rstr}$(printf '%*s' "$r_pad" '') " ;;
+      esac
+      printf '%s|%s%s%s||%s%s%s|%s\n' "$C" "$N" "$lpad" "$C" "$N" "$rfmt" "$C" "$N"
+    done
+
+    local r_fill_bot=$(( rw - ${#rdn_s} ))
+    [ "$r_fill_bot" -lt 1 ] && r_fill_bot=1
+    printf '%s+%s++%s%s%s%s+%s\n' \
+      "$C" "$(printf '%*s' "$lw" '' | tr ' ' '-')" \
+      "$(printf '%*s' "$r_fill_bot" '' | tr ' ' '-')" "$Y" "$rdn_s" "$C" "$N"
+    printf '%s%s%s\n' "$C" "${status_line:0:$cols}" "$N"
+    printf '%s%s%s' "$B" "${key_line:0:$cols}" "$N"
+
+    IFS= tty_read -rsn1 key || return 0
+    if [[ "$key" == $'\e' ]]; then
+      IFS= tty_read -rsn1 -t 0.05 k2 || k2=""
+      if [[ "$k2" == "[" ]]; then
+        IFS= tty_read -rsn1 -t 0.05 k3 || k3=""
+        case "$k3" in
+          A) sel=$(( sel > 1 ? sel - 1 : 3 )); chosen="$sel"; iscroll=0 ;;
+          B) sel=$(( sel < 3 ? sel + 1 : 1 )); chosen="$sel"; iscroll=0 ;;
+          5) IFS= tty_read -rsn1 -t 0.02 _ || true; iscroll=$(( iscroll > 5 ? iscroll - 5 : 0 )) ;;
+          6) IFS= tty_read -rsn1 -t 0.02 _ || true; iscroll=$(( iscroll + 5 )) ;;
+        esac
+      fi
+      continue
+    fi
+
+    case "$key" in
+      k|K) sel=$(( sel > 1 ? sel - 1 : 3 )); chosen="$sel"; iscroll=0 ;;
+      j|J) sel=$(( sel < 3 ? sel + 1 : 1 )); chosen="$sel"; iscroll=0 ;;
+      1|2|3) sel="$key"; chosen="$key"; iscroll=0 ;;
+      " ") chosen="$sel" ;;
+      l|L)
+        if [ "$UI_LANG" = "de" ]; then UI_LANG="en"; else UI_LANG="de"; fi
+        ;;
+      b|B|q|Q)
+        load_menu_texts
+        return 0
+        ;;
+      "")
+        chosen="$sel"
+        case "$chosen" in
+          1)
+            CLAM_MODE_WANT="live"
+            M_SEL[17]=1
+            if [ "$CLAM_MODE_CUR" = "cron" ]; then M_ACTIVE[17]=0; fi
+            ;;
+          2)
+            CLAM_MODE_WANT="cron"
+            M_SEL[17]=1
+            if [ "$CLAM_MODE_CUR" = "live" ]; then M_ACTIVE[17]=0; fi
+            ;;
+          3)
+            CLAM_MODE_WANT="none"
+            M_SEL[17]=0
+            ;;
+        esac
+        load_menu_texts
+        return 0
+        ;;
+    esac
+  done
+}
+
+tui_befund_screen() {
+  local scroll=0 key k2 k3
+  local host_str os_str vuln
+  host_str=$(hostname 2>/dev/null || echo "server")
+  os_str="${OS_PRETTY:-Linux}"
+  vuln=$(( ${#NEED_UPDATE[@]} + ${#DK_VULN[@]} ))
+
+  while true; do
+    clam_recommend
+    clam_mode_detect
+    local cols rows box_h text_w
+    cols=$(tput cols 2>/dev/null || echo 118)
+    rows=$(tput lines 2>/dev/null || echo 34)
+    [ "$cols" -lt 88 ] && cols=88
+    [ "$rows" -lt 22 ] && rows=22
+    box_h=$(( rows - 5 ))
+    text_w=$(( cols - 6 ))
+
+    local step_title box_title status_line key_line rec_line
+    local s_php s_dk s_stale s_att s_comp s_mit s_sess s_aud s_clam
+    if [ "$UI_LANG" = "en" ]; then
+      step_title="Step 2/3 - System Audit & Findings "
+      box_title="Info"
+      status_line=" Read-only system audit completed. Review findings below and press [Enter] to open the Remediation Menu."
+      key_line=" Up/Down/PgDn: scroll | Enter: Continue (Menu) | l: Language (DE/EN) | p/r: Print Report | q: Quit"
+
+      if [ "$COMP" -gt 0 ]; then
+        rec_line="${R}${B}SUSPECTED COMPROMISE!${N} Recommended: [1] Preserve evidence -> Disconnect -> [3/4/6] Patch -> [10] Restart -> [12] Quarantine -> [11] Sessions -> [15] Rotate secrets."
+      elif [ "$vuln" -gt 0 ]; then
+        rec_line="${Y}${B}PHP IS VULNERABLE (No compromise detected).${N} BSI: Patch immediately ([3]/[4]+[5]/[6]) or apply ALL BSI workarounds ([7]+[8]+[9]) -> [10] Restart -> [11] Sessions."
+      elif [ "$ATT" -gt 0 ]; then
+        rec_line="${Y}${B}PHP patched, but attack/segfault indicators found.${N} Recommended: [1] Evidence, [13] auditd monitoring, [15] Rotate secrets."
+      elif [ "$STALE" -gt 0 ]; then
+        rec_line="${Y}${B}Patched on disk, but services still run old PHP in RAM.${N} Recommended: [10] Restart PHP-FPM / web services."
+      else
+        rec_line="${G}${B}No immediate action required.${N} Optional: [13] auditd monitoring, [17] ClamAV protection, [15] Print audit report."
+      fi
+
+      if [ "${#NEED_UPDATE[@]}" -gt 0 ]; then s_php="${R}${B}VULNERABLE (${#NEED_UPDATE[@]} package/binary target(s))${N}"; else s_php="${G}${B}PATCHED / OK${N}"; fi
+      if [ "${#DK_VULN[@]}" -gt 0 ]; then s_dk="${R}${B}VULNERABLE (${#DK_VULN[@]} container(s))${N}"; else s_dk="${G}${B}OK / None vulnerable${N}"; fi
+      if [ "$STALE" -gt 0 ]; then s_stale="${Y}${B}RESTART REQUIRED ($STALE process(es))${N}"; else s_stale="${G}${B}Up to date in RAM${N}"; fi
+      if [ "$ATT" -gt 0 ]; then s_att="${Y}${B}$ATT indicator(s) found${N}"; else s_att="${G}${B}None (0)${N}"; fi
+      if [ "$COMP" -gt 0 ]; then s_comp="${R}${B}$COMP CRITICAL indicator(s)!${N}"; else s_comp="${G}${B}None (0)${N}"; fi
+      if [ "$CLAM_MODE_CUR" = "live" ]; then
+        s_clam="${G}${B}[x] Active (Real-time clamd+On-Access)${N} | RAM suggestion: ${CLAM_REC} (~${CLAM_EFF_MB} MB free)"
+      elif [ "$CLAM_MODE_CUR" = "cron" ]; then
+        s_clam="${G}${B}[x] Active (Daily Cron/Timer 03:30)${N} | RAM suggestion: ${CLAM_REC} (~${CLAM_EFF_MB} MB free)"
+      else
+        s_clam="[ ] Inactive | RAM suggestion: ${Y}${B}${CLAM_REC}${N} (~${CLAM_EFF_MB} MB free)"
+      fi
+    else
+      step_title="Schritt 2/3 - Systempruefung & Befund "
+      box_title="Info"
+      status_line=" Lesende Systempruefung abgeschlossen. Befund pruefen und mit [Enter] weiter zur Massnahmen-Auswahl."
+      key_line=" Pfeile/Bild: scrollen | Enter: Weiter (Menue) | l: Sprache (DE/EN) | p/r: Drucken | q: Abbruch"
+
+      if [ "$COMP" -gt 0 ]; then
+        rec_line="${R}${B}VERDACHT AUF BEFALL!${N} Empfehlung: [1] Beweise sichern -> Vom Netz trennen -> [3/4/6] Update -> [10] Dienste neu starten -> [12] Quarantaene -> [11] Sessions -> [15] Secrets rotieren."
+      elif [ "$vuln" -gt 0 ]; then
+        rec_line="${Y}${B}PHP ist verwundbar, kein Befall erkannt.${N} BSI-Empfehlung: Sofort Update ([3]/[4]+[5]/[6]) oder ALLE BSI-Workarounds ([7]+[8]+[9]) -> [10] Dienste neu starten -> [11] Sessions."
+      elif [ "$ATT" -gt 0 ]; then
+        rec_line="${Y}${B}PHP gepatcht, aber Hinweise auf Angriffsversuche/Segfaults.${N} Empfohlen: [1] Beweise sichern, [13] auditd-Ueberwachung, [15] Secrets rotieren."
+      elif [ "$STALE" -gt 0 ]; then
+        rec_line="${Y}${B}Gepatcht, aber Dienste laufen noch mit altem Code im RAM.${N} Empfohlen: [10] Dienste neu starten."
+      else
+        rec_line="${G}${B}Kein unmittelbarer Handlungsbedarf erkannt.${N} Optional: [13] auditd-Ueberwachung, [17] ClamAV-Schutz, [15] Revisionsbericht drucken."
+      fi
+
+      if [ "${#NEED_UPDATE[@]}" -gt 0 ]; then s_php="${R}${B}VERWUNDBAR (${#NEED_UPDATE[@]} Ziel(e))${N}"; else s_php="${G}${B}GEPATCHT / OK${N}"; fi
+      if [ "${#DK_VULN[@]}" -gt 0 ]; then s_dk="${R}${B}VERWUNDBAR (${#DK_VULN[@]} Container)${N}"; else s_dk="${G}${B}OK / Keine verwundbaren Container${N}"; fi
+      if [ "$STALE" -gt 0 ]; then s_stale="${Y}${B}NEUSTART NOETIG ($STALE Prozess(e))${N}"; else s_stale="${G}${B}Aktuell im RAM${N}"; fi
+      if [ "$ATT" -gt 0 ]; then s_att="${Y}${B}$ATT Hinweis(e) gefunden${N}"; else s_att="${G}${B}Keine (0)${N}"; fi
+      if [ "$COMP" -gt 0 ]; then s_comp="${R}${B}$COMP KRITISCHE Treffer!${N}"; else s_comp="${G}${B}Keine (0)${N}"; fi
+      if [ "$CLAM_MODE_CUR" = "live" ]; then
+        s_clam="${G}${B}[x] Aktiv (Echtzeit clamd+On-Access)${N} | RAM-Vorschlag: ${CLAM_REC} (~${CLAM_EFF_MB} MB frei)"
+      elif [ "$CLAM_MODE_CUR" = "cron" ]; then
+        s_clam="${G}${B}[x] Aktiv (Zeitplan/Cronjob 03:30)${N} | RAM-Vorschlag: ${CLAM_REC} (~${CLAM_EFF_MB} MB frei)"
+      else
+        s_clam="[ ] Inaktiv | RAM-Vorschlag: ${Y}${B}${CLAM_REC}${N} (~${CLAM_EFF_MB} MB frei)"
+      fi
+    fi
+
+    if [ "${M_ACTIVE[7]:-0}" -eq 1 ]; then s_mit="${G}${B}[x] $( [ "$UI_LANG" = "en" ] && echo "Active" || echo "Aktiv" )${N}"; else s_mit="[ ] $( [ "$UI_LANG" = "en" ] && echo "Inactive" || echo "Inaktiv" )"; fi
+    if [ "${M_ACTIVE[8]:-0}" -eq 1 ]; then s_sess="${G}${B}[x] $( [ "$UI_LANG" = "en" ] && echo "Active" || echo "Aktiv" )${N}"; else s_sess="[ ] $( [ "$UI_LANG" = "en" ] && echo "Inactive" || echo "Inaktiv" )"; fi
+    if [ "${M_ACTIVE[13]:-0}" -eq 1 ]; then s_aud="${G}${B}[x] $( [ "$UI_LANG" = "en" ] && echo "Active" || echo "Aktiv" )${N}"; else s_aud="[ ] $( [ "$UI_LANG" = "en" ] && echo "Inactive" || echo "Inaktiv" )"; fi
+
+    local -a blines=()
+    blines+=("")
+    blines+=("  ${B}Server:${N} ${host_str}   ${B}System:${N} ${os_str}   ${B}CRIT:${N} ${R}${B}${CRIT}${N}   ${B}WARN:${N} ${Y}${B}${WARN}${N}   ${B}COMP:${N} ${R}${B}${COMP}${N}   ${B}ATT:${N} ${Y}${B}${ATT}${N}")
+    blines+=("")
+    if [ "$UI_LANG" = "en" ]; then
+      blines+=("  This tool audits the server for ${B}CVE-2026-109618 & CVE-2026-109619 (PHP2Shell)${N} per BSI advisory.")
+      blines+=("  No changes have been made yet. You decide in the next step which actions to apply or roll back.")
+    else
+      blines+=("  Dieses Werkzeug prueft den Server auf ${B}CVE-2026-109618 & CVE-2026-109619 (PHP2Shell)${N} gemaess BSI-Warnung.")
+      blines+=("  Es wurde noch nichts veraendert. Sie entscheiden im naechsten Schritt selbst, was umgesetzt wird.")
+    fi
+    blines+=("")
+
+    local rline wline
+    while IFS= read -r wline; do
+      blines+=("  $wline")
+    done < <(printf '%s\n' "$rec_line" | fold -s -w "$((text_w - 2))")
+
+    blines+=("")
+    if [ "$UI_LANG" = "en" ]; then
+      blines+=("  ${C}${B}CURRENT SYSTEM FINDINGS OVERVIEW:${N}")
+      blines+=("    Host PHP Packages/Binaries : $s_php")
+      blines+=("    Docker / OCI Containers    : $s_dk")
+      blines+=("    Running Services (RAM)     : $s_stale")
+      blines+=("    Attack / Crash Indicators  : $s_att")
+      blines+=("    Compromise / Webshells     : $s_comp")
+      blines+=("    BSI Workarounds (#7/#8)    : INI Drop-in: $s_mit | Session Storage: $s_sess | Auditd (#13): $s_aud")
+      blines+=("    ClamAV Protection (#17)    : $s_clam")
+      blines+=("")
+      blines+=("  ${C}${B}DETAILED SCAN LOG (scroll with Up/Down/PgDn):${N}")
+      blines+=("  $(printf '%*s' "$((text_w - 4))" '' | tr ' ' '-')")
+    else
+      blines+=("  ${C}${B}AKTUELLER BEFUND (ZUSAMMENFASSUNG):${N}")
+      blines+=("    Host-PHP-Pakete/Binaries   : $s_php")
+      blines+=("    Docker / OCI Container     : $s_dk")
+      blines+=("    Laufende Dienste (RAM)     : $s_stale")
+      blines+=("    Angriffs-/Segfault-Spuren  : $s_att")
+      blines+=("    Kompromittierung/Webshells : $s_comp")
+      blines+=("    BSI-Workarounds (#7/#8)    : INI-Drop-in: $s_mit | Session-Schutz: $s_sess | Auditd (#13): $s_aud")
+      blines+=("    ClamAV Malwareschutz (#17) : $s_clam")
+      blines+=("")
+      blines+=("  ${C}${B}DETAILLIERTER SCAN-BERICHT (mit Pfeiltasten / Bild-ab scrollen):${N}")
+      blines+=("  $(printf '%*s' "$((text_w - 4))" '' | tr ' ' '-')")
+    fi
+
+    if [ -n "${SCAN_CAPTURED:-}" ] && [ -s "$SCAN_CAPTURED" ]; then
+      while IFS= read -r rline; do
+        rline=$(printf '%s' "$rline" | tr '\t' ' ')
+        local plain_r
+        plain_r=$(printf '%s' "$rline" | sed $'s/\e\\[[0-9;]*[a-zA-Z]//g')
+        if [ "${#plain_r}" -gt "$((text_w - 2))" ]; then
+          while IFS= read -r wline; do
+            blines+=("  $wline")
+          done < <(printf '%s\n' "$plain_r" | fold -s -w "$((text_w - 2))")
+        else
+          blines+=("  $rline")
+        fi
+      done < "$SCAN_CAPTURED"
+    fi
+
+    local total="${#blines[@]}"
+    local max_scroll=$(( total - box_h ))
+    [ "$max_scroll" -lt 0 ] && max_scroll=0
+    [ "$scroll" -gt "$max_scroll" ] && scroll="$max_scroll"
+    [ "$scroll" -lt 0 ] && scroll=0
+
+    local more_up=0 more_dn=0
+    [ "$scroll" -gt 0 ] && more_up=1
+    [ $(( scroll + box_h )) -lt "$total" ] && more_dn=1
+
+    printf '\e[H\e[2J'
+    tui_topbar "$cols" " IT-Reinbek PHP2Shell-Auditor v${VERSION}" "$step_title"
+    tui_single_box_top "$cols" "$box_title" "$more_up"
+
+    local idx line plain plen pad
+    for (( idx=0; idx<box_h; idx++ )); do
+      line="${blines[$(( scroll + idx ))]:-}"
+      plain=$(printf '%s' "$line" | sed $'s/\e\\[[0-9;]*[a-zA-Z]//g')
+      plen="${#plain}"
+      pad=$(( cols - 4 - plen ))
+      [ "$pad" -lt 0 ] && pad=0
+      printf '%s|%s %s%*s %s|%s\n' "$C" "$N" "$line" "$pad" "" "$C" "$N"
+    done
+
+    tui_single_box_bot "$cols" "$more_dn"
+    printf '%s%s%s\n' "$C" "${status_line:0:$cols}" "$N"
+    printf '%s%s%s' "$B" "${key_line:0:$cols}" "$N"
+
+    IFS= tty_read -rsn1 key || return 1
+    if [[ "$key" == $'\e' ]]; then
+      IFS= tty_read -rsn1 -t 0.05 k2 || k2=""
+      if [[ "$k2" == "[" ]]; then
+        IFS= tty_read -rsn1 -t 0.05 k3 || k3=""
+        case "$k3" in
+          A) scroll=$(( scroll - 1 )) ;;
+          B) scroll=$(( scroll + 1 )) ;;
+          5) IFS= tty_read -rsn1 -t 0.02 _ || true; scroll=$(( scroll - box_h / 2 )) ;;
+          6) IFS= tty_read -rsn1 -t 0.02 _ || true; scroll=$(( scroll + box_h / 2 )) ;;
+        esac
+      fi
+      continue
+    fi
+
+    case "$key" in
+      k|K) scroll=$(( scroll - 1 )) ;;
+      j|J) scroll=$(( scroll + 1 )) ;;
+      " ") scroll=$(( scroll + box_h / 2 )) ;;
+      l|L)
+        if [ "$UI_LANG" = "de" ]; then UI_LANG="en"; else UI_LANG="de"; fi
+        load_menu_texts 2>/dev/null || true
+        ;;
+      p|P)
+        clear
+        act_rotate
+        printf '\n%s[Enter] ...%s' "$B" "$N"
+        tty_read -r _ || true
+        ;;
+      r|R)
+        clear
+        act_print_full_report
+        printf '\n%s[Enter] ...%s' "$B" "$N"
+        tty_read -r _ || true
+        ;;
+      ""|m|M)
+        return 0
+        ;;
+      q|Q)
+        clear
+        return 1
+        ;;
+    esac
+  done
+}
+
 tui_render() {
-  local cur="$1" cols lw rw=46 i mark state_txt num title lpad rline wline
+  local cur="$1" iscroll="${2:-0}"
+  local cols rows lw rw box_h i mark state_txt badge num title lpad rline wline
   cols=$(tput cols 2>/dev/null || echo 118)
+  rows=$(tput lines 2>/dev/null || echo 34)
   [ "$cols" -lt 96 ] && cols=96
-  lw=50
-  rw=$(( cols - lw - 5 ))
-  [ "$rw" -lt 40 ] && rw=40
+  [ "$rows" -lt 24 ] && rows=24
+
+  lw=$(( cols * 46 / 100 ))
+  [ "$lw" -lt 44 ] && lw=44
+  [ "$lw" -gt 62 ] && lw=62
+  rw=$(( cols - lw - 4 ))
+  [ "$rw" -lt 36 ] && rw=36
+  box_h=$(( rows - 6 ))
+  [ "$box_h" -lt 16 ] && box_h=16
+
+  local r_inner=$(( rw - 2 ))
 
   if [ "$UI_LANG" = "en" ]; then
     if [ "${M_ACTIVE[$cur]}" -eq 1 ] && [ "${M_SEL[$cur]}" -eq 1 ]; then
@@ -3235,13 +4179,13 @@ tui_render() {
     fi
   else
     if [ "${M_ACTIVE[$cur]}" -eq 1 ] && [ "${M_SEL[$cur]}" -eq 1 ]; then
-      state_txt="AKTIV / KONFIGURIERT [x] (Abwählen mit Leertaste markiert zur RÜCKABWICKLUNG [-])"
+      state_txt="AKTIV / KONFIGURIERT [x] (Abwaehlen mit Leertaste markiert zur RUECKABWICKLUNG [-])"
     elif [ "${M_ACTIVE[$cur]}" -eq 1 ] && [ "${M_SEL[$cur]}" -eq 0 ]; then
-      state_txt="ZUR RÜCKABWICKLUNG VORGEMERKT [-] (wird bei [Enter] rückgängig gemacht!)"
+      state_txt="ZUR RUECKABWICKLUNG VORGEMERKT [-] (wird bei [Enter] rueckgaengig gemacht!)"
     elif [ "${M_ACTIVE[$cur]}" -eq 0 ] && [ "${M_SEL[$cur]}" -eq 1 ]; then
-      state_txt="ZUR AKTIVIERUNG VORGEMERKT [+] (wird bei [Enter] ausgeführt/konfiguriert!)"
+      state_txt="ZUR AKTIVIERUNG VORGEMERKT [+] (wird bei [Enter] ausgefuehrt/konfiguriert!)"
     else
-      state_txt="NICHT KONFIGURIERT [ ] (Anwählen mit Leertaste markiert zur Aktivierung [+])"
+      state_txt="NICHT KONFIGURIERT [ ] (Anwaehlen mit Leertaste markiert zur Aktivierung [+])"
     fi
   fi
 
@@ -3272,41 +4216,94 @@ tui_render() {
     else
       while IFS= read -r wline; do
         rlines+=("$wline")
-      done < <(printf '%s\n' "$rline" | fold -s -w "$rw")
+      done < <(printf '%s\n' "$rline" | fold -s -w "$r_inner")
     fi
   done <<< "$raw_right"
 
   local -a llines=()
-  local last_cat=""
-  for i in {1..16}; do
+  local last_cat="" cur_row_idx=0
+  for i in {1..17}; do
     if [ "${M_CAT[$i]}" != "$last_cat" ]; then
       last_cat="${M_CAT[$i]}"
       llines+=("CAT|$last_cat")
     fi
+    [ "$i" -eq "$cur" ] && cur_row_idx="${#llines[@]}"
     llines+=("ITEM|$i")
   done
 
-  printf '\e[H\e[2J'
-  if [ "$UI_LANG" = "en" ]; then
-    printf '%sPHP2Shell-Check v%s TUI%s (BSI v1.1 | EN) | Findings: %sCRIT:%d%s %sWARN:%d%s %sCOMP:%d%s | Legend: %s[x]=Active%s %s[+]=New%s %s[-]=Rollback%s\n' \
-      "$B" "$VERSION" "$N" "$R" "$CRIT" "$N" "$Y" "$WARN" "$N" "$R" "$COMP" "$N" "$G" "$N" "$Y" "$N" "$R" "$N"
-    printf '%s\n' "$(printf '%*s' "$cols" '' | tr ' ' '=')"
-    printf '%s%-*s%s | %s%s%s\n' "$B" "$lw" " STATUS & ACTIONS (1-16 without gaps)" "$N" "$B" "EXPLANATION, STATUS & ROLLBACK" "$N"
-  else
-    printf '%sPHP2Shell-Check v%s TUI%s (BSI v1.1 | DE) | Befund: %sCRIT:%d%s %sWARN:%d%s %sCOMP:%d%s | Legende: %s[x]=Aktiv%s %s[+]=Neu%s %s[-]=Rückabwickeln%s\n' \
-      "$B" "$VERSION" "$N" "$R" "$CRIT" "$N" "$Y" "$WARN" "$N" "$R" "$COMP" "$N" "$G" "$N" "$Y" "$N" "$R" "$N"
-    printf '%s\n' "$(printf '%*s' "$cols" '' | tr ' ' '=')"
-    printf '%s%-*s%s | %s%s%s\n' "$B" "$lw" " STATUS & MAßNAHMEN (1-16 ohne Lücken)" "$N" "$B" "ERKLÄRUNG, STATUS & RÜCKABWICKLUNG" "$N"
+  local l_total="${#llines[@]}"
+  local lscroll=0
+  if [ "$l_total" -gt "$box_h" ]; then
+    lscroll=$(( cur_row_idx - box_h / 2 ))
+    local lmax=$(( l_total - box_h ))
+    [ "$lscroll" -gt "$lmax" ] && lscroll="$lmax"
+    [ "$lscroll" -lt 0 ] && lscroll=0
   fi
-  printf '%s+%s\n' "$(printf '%*s' "$lw" '' | tr ' ' '-')" "$(printf '%*s' "$((rw+2))" '' | tr ' ' '-')"
+  local l_more_up=0 l_more_dn=0
+  [ "$lscroll" -gt 0 ] && l_more_up=1
+  [ $(( lscroll + box_h )) -lt "$l_total" ] && l_more_dn=1
 
-  local max_rows="${#llines[@]}"
-  [ "${#rlines[@]}" -gt "$max_rows" ] && max_rows="${#rlines[@]}"
+  local r_total="${#rlines[@]}"
+  local rmax=$(( r_total - box_h ))
+  [ "$rmax" -lt 0 ] && rmax=0
+  [ "$iscroll" -gt "$rmax" ] && iscroll="$rmax"
+  [ "$iscroll" -lt 0 ] && iscroll=0
+  local r_more_up=0 r_more_dn=0
+  [ "$iscroll" -gt 0 ] && r_more_up=1
+  [ $(( iscroll + box_h )) -lt "$r_total" ] && r_more_dn=1
 
-  local row lentry ltype lid lstr rstr rfmt raw_len pad_len item_color
-  for (( row=0; row<max_rows; row++ )); do
-    lentry="${llines[$row]:-}"
-    rstr="${rlines[$row]:-}"
+  local count_new=0 count_undo=0 count_act=0
+  for i in {1..17}; do
+    [ "${M_ACTIVE[$i]}" -eq 1 ] && count_act=$(( count_act + 1 ))
+    if [ "${M_ACTIVE[$i]}" -eq 0 ] && [ "${M_SEL[$i]}" -eq 1 ]; then count_new=$(( count_new + 1 )); fi
+    if [ "${M_ACTIVE[$i]}" -eq 1 ] && [ "${M_SEL[$i]}" -eq 0 ]; then count_undo=$(( count_undo + 1 )); fi
+  done
+
+  local step_title l_box_title r_box_title status_line key_line
+  if [ "$UI_LANG" = "en" ]; then
+    step_title="Step 3/3 - Remediation (CRIT:${CRIT} WARN:${WARN} COMP:${COMP}) "
+    l_box_title="Selection (1-17)"
+    r_box_title="Info"
+    status_line=" Active [x]: ${count_act} | Marked for activation [+]: ${count_new} | Marked for rollback [-]: ${count_undo} | Enter applies changes."
+    key_line=" Arrows: select | Space: [x]/[+]/[-] | c: ClamAV | PgUp/Dn: Info | Enter: Apply | b: Findings | l: DE/EN | q: Quit"
+  else
+    step_title="Schritt 3/3 - Massnahmen (CRIT:${CRIT} WARN:${WARN} COMP:${COMP}) "
+    l_box_title="Auswahl (1-17)"
+    r_box_title="Info"
+    status_line=" Aktiv [x]: ${count_act} | Zur Aktivierung [+]: ${count_new} | Zur Rueckabwicklung [-]: ${count_undo} | Enter fuehrt Aenderungen aus."
+    key_line=" Pfeile: Wahl | Leertaste: [x]/[+]/[-] | c: ClamAV | Bild^/v: Info | Enter: Weiter | b: Befund | l: DE/EN | q: Ende"
+  fi
+
+  printf '\e[H\e[2J'
+  tui_topbar "$cols" " IT-Reinbek PHP2Shell-Auditor v${VERSION}" "$step_title"
+
+  if [ "$UI_LANG" = "en" ]; then
+    printf ' Select actions with Space. Legend: %s[x] Active%s | %s[+] Activate (new)%s | %s[-] Rollback%s | [ ] Inactive\n' \
+      "$G$B" "$N" "$Y$B" "$N" "$R$B" "$N"
+  else
+    printf ' Waehlen Sie die gewuenschten Massnahmen. Legende: %s[x] Aktiv%s | %s[+] Neu aktivieren%s | %s[-] Rueckabwickeln%s | [ ] Inaktiv\n' \
+      "$G$B" "$N" "$Y$B" "$N" "$R$B" "$N"
+  fi
+
+  local lup_s="" rup_s="" ldn_s="" rdn_s=""
+  if [ "$l_more_up" -eq 1 ]; then lup_s=$( [ "$UI_LANG" = "en" ] && echo " ^more " || echo " ^mehr " ); fi
+  if [ "$r_more_up" -eq 1 ]; then rup_s=$( [ "$UI_LANG" = "en" ] && echo " ^more " || echo " ^mehr " ); fi
+  if [ "$l_more_dn" -eq 1 ]; then ldn_s=$( [ "$UI_LANG" = "en" ] && echo " v more " || echo " v mehr " ); fi
+  if [ "$r_more_dn" -eq 1 ]; then rdn_s=$( [ "$UI_LANG" = "en" ] && echo " PgDn v more " || echo " Bild v mehr " ); fi
+
+  local l_fill_top=$(( lw - ${#l_box_title} - ${#lup_s} - 4 ))
+  [ "$l_fill_top" -lt 1 ] && l_fill_top=1
+  local r_fill_top=$(( rw - ${#r_box_title} - ${#rup_s} - 4 ))
+  [ "$r_fill_top" -lt 1 ] && r_fill_top=1
+
+  printf '%s+-- %s%s%s %s%s%s%s++-- %s%s%s %s%s%s%s+%s\n' \
+    "$C" "$C$B" "$l_box_title" "$N$C" "$(printf '%*s' "$l_fill_top" '' | tr ' ' '-')" "$Y" "$lup_s" "$C" \
+    "$C$B" "$r_box_title" "$N$C" "$(printf '%*s' "$r_fill_top" '' | tr ' ' '-')" "$Y" "$rup_s" "$C" "$N"
+
+  local row lentry ltype lid lstr rstr rfmt raw_len pad_len item_color r_plain r_pad max_tlen
+  for (( row=0; row<box_h; row++ )); do
+    lentry="${llines[$(( lscroll + row ))]:-}"
+    rstr="${rlines[$(( iscroll + row ))]:-}"
 
     if [ -z "$lentry" ]; then
       lpad=$(printf '%*s' "$lw" '')
@@ -3318,63 +4315,88 @@ tui_render() {
         lstr="${lstr:0:$lw}"
         raw_len="${#lstr}"
         pad_len=$(( lw - raw_len ))
+        [ "$pad_len" -lt 0 ] && pad_len=0
         lpad="${C}${B}${lstr}${N}$(printf '%*s' "$pad_len" '')"
       else
         item_color=""
         if [ "${M_ACTIVE[$lid]}" -eq 1 ] && [ "${M_SEL[$lid]}" -eq 1 ]; then
           mark="x"; item_color="$G"
+          badge=$( [ "$UI_LANG" = "en" ] && echo "[active]" || echo "[aktiv]" )
         elif [ "${M_ACTIVE[$lid]}" -eq 1 ] && [ "${M_SEL[$lid]}" -eq 0 ]; then
           mark="-"; item_color="${R}${B}"
+          badge=$( [ "$UI_LANG" = "en" ] && echo "[- rollback]" || echo "[- rueckbau]" )
         elif [ "${M_ACTIVE[$lid]}" -eq 0 ] && [ "${M_SEL[$lid]}" -eq 1 ]; then
           mark="+"; item_color="${Y}${B}"
+          badge=$( [ "$UI_LANG" = "en" ] && echo "[+ new]" || echo "[+ neu]" )
         else
           mark=" "; item_color=""
+          badge=$( [ "$UI_LANG" = "en" ] && echo "[inactive]" || echo "[inaktiv]" )
         fi
 
         printf -v num "%2d" "$lid"
         title="${M_TITLE[$lid]}"
+        max_tlen=$(( lw - 13 - ${#badge} ))
+        [ "$max_tlen" -lt 10 ] && max_tlen=10
+        title="${title:0:$max_tlen}"
+
         if [ "$lid" -eq "$cur" ]; then
           lstr=" > [$mark] $num) $title"
         else
           lstr="   [$mark] $num) $title"
         fi
-        lstr="${lstr:0:$lw}"
-        raw_len="${#lstr}"
+        raw_len=$(( ${#lstr} + ${#badge} + 1 ))
         pad_len=$(( lw - raw_len ))
+        [ "$pad_len" -lt 1 ] && pad_len=1
+        lstr="${lstr}$(printf '%*s' "$pad_len" '')${badge} "
+
         if [ "$lid" -eq "$cur" ]; then
-          lpad=$'\e[7m'"${B}${lstr}"$(printf '%*s' "$pad_len" '')$'\e[0m'
+          if [ -n "$item_color" ]; then
+            lpad=$'\e[7m'"${item_color}${B}${lstr}"$'\e[0m'
+          else
+            lpad=$'\e[7m'"${B}${lstr}"$'\e[0m'
+          fi
         elif [ -n "$item_color" ]; then
-          lpad="${item_color}${lstr}${N}$(printf '%*s' "$pad_len" '')"
+          lpad="${item_color}${lstr}${N}"
         else
-          lpad="${lstr}$(printf '%*s' "$pad_len" '')"
+          lpad="${lstr}"
         fi
       fi
     fi
 
+    rstr="${rstr:0:$r_inner}"
+    r_plain="$rstr"
+    r_pad=$(( r_inner - ${#r_plain} ))
+    [ "$r_pad" -lt 0 ] && r_pad=0
+
     case "$rstr" in
-      MAßNAHME*|AKTUELLER\ SYSTEM*|EINGRIFFSTIEFE*|WAS\ MACHT*|FOLGEN*|RÜCKABWICKLUNG*|ACTION\ \#*|CURRENT\ SYSTEM*|IMPACT\ LEVEL*|WHAT\ DOES*|CONSEQUENCES*|ROLLBACK\ *)
-        rfmt="${B}${C}${rstr}${N}" ;;
-      *ZUR\ RÜCKABWICKLUNG*|*HOCH*|*WARNUNG*|*MARKED\ FOR\ ROLLBACK*|*HIGH*)
-        rfmt="${R}${B}${rstr}${N}" ;;
+      MAßNAHME*|ACTION\ \#*)
+        rfmt=" ${B}${rstr}${N}$(printf '%*s' "$r_pad" '') " ;;
+      AKTUELLER\ SYSTEM*|EINGRIFFSTIEFE*|WAS\ MACHT*|FOLGEN*|RÜCKABWICKLUNG*|CURRENT\ SYSTEM*|IMPACT\ LEVEL*|WHAT\ DOES*|CONSEQUENCES*|ROLLBACK\ *)
+        rfmt=" ${B}${C}${rstr}${N}$(printf '%*s' "$r_pad" '') " ;;
+      *ZUR\ RUECKABWICKLUNG*|*ZUR\ RÜCKABWICKLUNG*|*HOCH*|*WARNUNG*|*MARKED\ FOR\ ROLLBACK*|*HIGH*)
+        rfmt=" ${R}${B}${rstr}${N}$(printf '%*s' "$r_pad" '') " ;;
       *ZUR\ AKTIVIERUNG*|*MARKED\ FOR\ ACTIVATION*)
-        rfmt="${Y}${B}${rstr}${N}" ;;
+        rfmt=" ${Y}${B}${rstr}${N}$(printf '%*s' "$r_pad" '') " ;;
       *AKTIV\ /\ KONFIGURIERT*|*KEINE\ ÄNDERUNG*|*ACTIVE\ /\ CONFIGURED*|*NO\ CHANGE*)
-        rfmt="${G}${B}${rstr}${N}" ;;
+        rfmt=" ${G}${B}${rstr}${N}$(printf '%*s' "$r_pad" '') " ;;
       *)
-        rfmt="$rstr" ;;
+        rfmt=" ${rstr}$(printf '%*s' "$r_pad" '') " ;;
     esac
 
-    printf '%s | %s\n' "$lpad" "$rfmt"
+    printf '%s|%s%s%s||%s%s%s|%s\n' "$C" "$N" "$lpad" "$C" "$N" "$rfmt" "$C" "$N"
   done
 
-  printf '%s+%s\n' "$(printf '%*s' "$lw" '' | tr ' ' '-')" "$(printf '%*s' "$((rw+2))" '' | tr ' ' '-')"
-  if [ "$UI_LANG" = "en" ]; then
-    printf '%sControls:%s  [Up/Down] or [j/k] = Navigate | [Space] = Toggle checkbox (Activate [+] / Rollback [-]) | [l] = Language (DE/EN)\n' "$B" "$N"
-    printf '           [Enter] or [x] = Apply changes | [p] = Print checklist | [r] = Print full report + checklist | [q] = Quit\n'
-  else
-    printf '%sSteuerung:%s [Pfeil Hoch/Runter] od. [j/k] = Navigieren | [Leertaste] = Checkbox umschalten ([+] / [-]) | [l] = Sprache (DE/EN)\n' "$B" "$N"
-    printf '           [Enter] od. [x] = Änderungen anwenden | [p] = Checkliste drucken | [r] = Scan-Report + Checkliste drucken | [q] = Ende\n'
-  fi
+  local l_fill_bot=$(( lw - ${#ldn_s} ))
+  [ "$l_fill_bot" -lt 1 ] && l_fill_bot=1
+  local r_fill_bot=$(( rw - ${#rdn_s} ))
+  [ "$r_fill_bot" -lt 1 ] && r_fill_bot=1
+
+  printf '%s+%s%s%s%s++%s%s%s%s+%s\n' \
+    "$C" "$(printf '%*s' "$l_fill_bot" '' | tr ' ' '-')" "$Y" "$ldn_s" "$C" \
+    "$(printf '%*s' "$r_fill_bot" '' | tr ' ' '-')" "$Y" "$rdn_s" "$C" "$N"
+
+  printf '%s%s%s\n' "$C" "${status_line:0:$cols}" "$N"
+  printf '%s%s%s' "$B" "${key_line:0:$cols}" "$N"
 }
 
 interactive_menu() {
@@ -3384,24 +4406,23 @@ interactive_menu() {
   sleep 0.1
 
   if [ "$HAS_TTY" -ne 1 ]; then info "Kein interaktives Terminal - TUI-Menü übersprungen."; return 0; fi
-  if [ "$(id -u)" -ne 0 ]; then warn "Maßnahmen benötigen root (bitte mit sudo starten) - TUI-Menü übersprungen."; return 0; fi
+  if [ "$(id -u)" -ne 0 ]; then
+    recommend
+    warn "Maßnahmen benötigen root (bitte mit sudo starten) - TUI-Menü übersprungen."
+    return 0
+  fi
 
   ensure_state_dir
-  recommend
-  if [ "$UI_LANG" = "en" ]; then
-    printf '\n%sPress [Enter] to open the stateful split-screen TUI menu (or q to quit) ...%s ' "$B" "$N"
-  else
-    printf '\n%sDrücke [Enter], um das zustandsbasierte Split-Screen-TUI-Menü zu öffnen (oder q zum Beenden) ...%s ' "$B" "$N"
-  fi
-  local start_ans
-  tty_read -r start_ans || return 0
-  case "$start_ans" in q|Q|0) return 0 ;; esac
-
   init_menu_data
 
-  local cur=1 key k2 k3 num_buf="" i has_changes
+  # Schritt 2/3: Befund-Screen im Box-TUI anzeigen (Abbrechen mit q beendet sauber)
+  if ! tui_befund_screen; then
+    return 0
+  fi
+
+  local cur=1 iscroll=0 key k2 k3 num_buf="" i has_changes
   while true; do
-    tui_render "$cur"
+    tui_render "$cur" "$iscroll"
     IFS= tty_read -rsn1 key || break
 
     if [[ "$key" == $'\e' ]]; then
@@ -3409,22 +4430,37 @@ interactive_menu() {
       if [[ "$k2" == "[" ]]; then
         IFS= tty_read -rsn1 -t 0.05 k3 || k3=""
         case "$k3" in
-          A) cur=$(( cur > 1 ? cur - 1 : 16 )) ;;
-          B) cur=$(( cur < 16 ? cur + 1 : 1 )) ;;
+          A) cur=$(( cur > 1 ? cur - 1 : 17 )); iscroll=0 ;;
+          B) cur=$(( cur < 17 ? cur + 1 : 1 )); iscroll=0 ;;
+          5) IFS= tty_read -rsn1 -t 0.02 _ || true; iscroll=$(( iscroll > 5 ? iscroll - 5 : 0 )) ;;
+          6) IFS= tty_read -rsn1 -t 0.02 _ || true; iscroll=$(( iscroll + 5 )) ;;
         esac
       fi
       continue
     fi
 
     case "$key" in
-      k|K) cur=$(( cur > 1 ? cur - 1 : 16 )) ;;
-      j|J) cur=$(( cur < 16 ? cur + 1 : 1 )) ;;
+      k|K) cur=$(( cur > 1 ? cur - 1 : 17 )); iscroll=0 ;;
+      j|J) cur=$(( cur < 17 ? cur + 1 : 1 )); iscroll=0 ;;
+      c|C)
+        cur=17
+        iscroll=0
+        tui_clamav_screen
+        ;;
+      b|B)
+        if ! tui_befund_screen; then
+          clear
+          break
+        fi
+        ;;
       l|L)
         if [ "$UI_LANG" = "de" ]; then UI_LANG="en"; else UI_LANG="de"; fi
         load_menu_texts
         ;;
       " ")
-        if [ "${M_ACTIVE[$cur]}" -eq 1 ] && [ "${M_REVERSIBLE[$cur]}" -eq 0 ]; then
+        if [ "$cur" -eq 17 ]; then
+          tui_clamav_screen
+        elif [ "${M_ACTIVE[$cur]}" -eq 1 ] && [ "${M_REVERSIBLE[$cur]}" -eq 0 ]; then
           M_ACTIVE[$cur]=0; M_SEL[$cur]=1
         else
           M_SEL[$cur]=$(( 1 - M_SEL[$cur] ))
@@ -3452,23 +4488,31 @@ interactive_menu() {
         break
         ;;
       [0-9])
-        printf 'Nummer (1-16), Enter bestätigt: %s' "$key"
+        printf '\nNummer (1-17), Enter bestätigt: %s' "$key"
         tty_read -r -t 2 num_buf || num_buf=""
         num_buf="${key}${num_buf}"
-        if [[ "$num_buf" =~ ^[0-9]+$ ]] && [ "$num_buf" -ge 1 ] && [ "$num_buf" -le 16 ]; then
+        if [[ "$num_buf" =~ ^[0-9]+$ ]] && [ "$num_buf" -ge 1 ] && [ "$num_buf" -le 17 ]; then
           cur="$num_buf"
-          M_SEL[$cur]=$(( 1 - M_SEL[$cur] ))
+          iscroll=0
+          if [ "$cur" -eq 17 ]; then
+            tui_clamav_screen
+          else
+            M_SEL[$cur]=$(( 1 - M_SEL[$cur] ))
+          fi
         fi
         ;;
       ""|x|X)
         clear
         has_changes=0
-        for i in {1..16}; do
+        for i in {1..17}; do
           if [ "${M_SEL[$i]}" -ne "${M_ACTIVE[$i]}" ]; then has_changes=1; fi
         done
 
         if [ "$has_changes" -eq 0 ]; then
-          if [ "${M_ACTIVE[$cur]}" -eq 1 ] && [ "${M_REVERSIBLE[$cur]}" -eq 1 ]; then
+          if [ "$cur" -eq 17 ]; then
+            tui_clamav_screen
+            continue
+          elif [ "${M_ACTIVE[$cur]}" -eq 1 ] && [ "${M_REVERSIBLE[$cur]}" -eq 1 ]; then
             hdr "Maßnahme #$cur (${M_TITLE[$cur]}) ist bereits AKTIV [x]"
             if confirm "Möchtest du diese Maßnahme RÜCKABWICKELN (j) oder erneut ausführen (n)?"; then
               revert_action_by_id "$cur"
@@ -3481,7 +4525,7 @@ interactive_menu() {
           fi
         else
           hdr "Wende alle geänderten Checkboxen ([+] Aktivierung / [-] Rückabwicklung) an"
-          for i in {1..16}; do
+          for i in {1..17}; do
             if [ "${M_ACTIVE[$i]}" -eq 0 ] && [ "${M_SEL[$i]}" -eq 1 ]; then
               printf '\n%s>>> [+] AKTIVIERE Maßnahme #%d: %s <<<%s\n' "$B$Y" "$i" "${M_TITLE[$i]}" "$N"
               apply_action_by_id "$i"
