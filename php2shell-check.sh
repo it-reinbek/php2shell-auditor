@@ -1,15 +1,24 @@
 #!/usr/bin/env bash
 #
-# php2shell-check.sh  (v1.4.0 - Stateful TUI, Reversible Config & Emergency-Patch Edition)
+# php2shell-check.sh  (v1.5.0 - Stateful TUI, Reversible Config & Emergency-Patch Edition)
 # Prüft PHP auf CVE-2026-109618 (GHSA-w8hw-w9fx-j79w) & CVE-2026-109619 (GHSA-6wmf-4rv5-p3rp) ("PHP2Shell"),
 # berücksichtigt den BSI-IT-Sicherheitshinweis BITS-H Nr. 2026-297981-1132 (Version 1.1 vom 21.10.2026),
 # die Notfall-Updates (8.5.12 / 8.4.27 / 8.3.36 / 8.2.35 + EOL-Backports für 7.4 / 8.0 / 8.1)
 # sowie tagesaktuelle Analysen/IOCs (Armis, Abstract Security, Datadog, Sansec, Corelight, IT-Administrator).
 #
-# Neu in v1.4.0:
-# - 3-stufiges Vollbild-Box-TUI analog zum IT-Reinbek-Härtungsskript (Schritt 1/3: Rechtlicher Hinweis,
-#   Schritt 2/3: Systemprüfung & Befund-Screen, Schritt 3/3: Split-Box-Maßnahmen-Menü 1-17) unter
-#   Beibehaltung der Original-Farben & Marker ([x] Grün, [+] Gelb, [-] Rot, [ ] Weiß).
+# Neu in v1.5.0:
+# - Vorab-Abfrage & vollständige Telegram-Bot-Integration (Schritt 3/4 & Maßnahme #18):
+#     * Fragt vor dem Maßnahmen-Menü ab, ob Sicherheits-Infos via Telegram-Bot gesendet werden sollen,
+#       sammelt Bot-Token (verdeckte Eingabe), Chat-ID & Server-Label inkl. lesender API-Prüfung (getMe/getChat).
+#     * Legt die Zugangsdaten gegen unerlaubten Zugriff geschützt ab (/etc/it-reinbek 0700 root:root,
+#       /etc/it-reinbek/telegram.conf atomar per mktemp mit 0600 root:root, /usr/local/sbin/it-reinbek-notify
+#       mit 0750 root:root und Token-Übergabe per curl -K - Stdin ohne Sichtbarkeit in ps / /proc).
+#     * Hält die Einstellungen zentral für rkhunter, fail2ban, ClamAV und auditd vor (100% kompatibel mit
+#       dem IT-Reinbek Linux-Härtungsskript) und fragt bei der Konfiguration von auditd (#13, auch wenn
+#       bereits aktiv!) und ClamAV (#17) immer explizit ab, ob die Telegram-Benachrichtigung gewünscht ist.
+# - 4-stufiges Vollbild-Box-TUI analog zum IT-Reinbek-Härtungsskript (Schritt 1/4: Rechtlicher Hinweis,
+#   Schritt 2/4: Systemprüfung & Befund-Screen, Schritt 3/4: Telegram-Bot & Bausteine, Schritt 4/4:
+#   Split-Box-Maßnahmen-Menü 1-18) unter Beibehaltung der Original-Farben & Marker ([x] Grün, [+] Gelb, [-] Rot).
 # - ClamAV Malwareschutz (#17) mit automatischer RAM-Analyse & Empfehlung (Echtzeit clamd + clamonacc
 #   On-Access ab 3500 MB frei vs. täglicher Zeitplan-/Cronjob-Scan um 03:30 Uhr ab 1800 MB frei).
 # - Erweiterte Runtime-Inspektion & Drop-in-Härtung um display_errors (Schutz vor Adress-Leaks / ASLR-Bypass)
@@ -22,7 +31,7 @@
 #   auch nach der Hintergrund-Aufzeichnung (tee) unter sudo, SSH und Tabby.
 # - Erweiterte Erkennung der Notfall-Backports für PHP 7.4, 8.0 und 8.1 (Changelog + Build-Datum >= 21.10.2026).
 # - Vorgeschalteter rechtlicher Haftungsausschluss (Disclaimer zur Nutzung in Eigenverantwortung).
-# - Zustandsbasierte Split-Screen-TUI (Links Checkboxen 1-17 ohne Zähllücken, rechts Live-Erklärung):
+# - Zustandsbasierte Split-Screen-TUI (Links Checkboxen 1-18 ohne Zähllücken, rechts Live-Erklärung):
 #     * [x] (Grün)  = Maßnahme/Konfiguration ist bereits auf dem System AKTIV / angewendet
 #     * [ ] (Weiß)  = Maßnahme/Konfiguration ist NICHT aktiv
 #     * [+] (Gelb)  = Neu ausgewählt -> wird beim Ausführen [Enter] AKTIVIERT / installiert
@@ -38,7 +47,7 @@
 #
 set -uo pipefail
 
-VERSION="1.4.0"
+VERSION="1.5.0"
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 SINCE="2026-10-17"
 REPORT=""
@@ -254,7 +263,7 @@ show_legal_disclaimer() {
 
     local raw_disc step_title box_title status_line key_line
     if [ "$UI_LANG" = "en" ]; then
-      step_title="Step 1/3 - Legal Disclaimer "
+      step_title="Step 1/4 - Legal Disclaimer "
       box_title="Disclaimer & Terms of Use (BSI Advisory)"
       status_line=" Please read carefully. Press [Enter] or [y] to accept and start the read-only system audit."
       key_line=" Up/Down/PgDn: scroll | Enter/y: I ACCEPT (Start Audit) | l: Language (DE/EN) | q: Quit"
@@ -270,7 +279,7 @@ ${C}${B}2. No Guarantee of Detection or Complete Protection${N}
 A scan with zero findings ("0 CRIT / 0 WARN") is NOT proof that the system has not been compromised. Temporary workarounds per BSI (BITS-H 2026-297981-1132) do not replace official security patches.
 
 ${C}${B}3. System Modifications, Rollback & Operational Risks${N}
-The initial scan (Step 2/3) is strictly read-only. However, if you actively enable or revert remediation steps in the subsequent TUI menu (Step 3/3: package updates, PHP branch switch, Docker Compose stop/recreate, config changes, quarantine), the script modifies the live system. Despite built-in backups and rollback mechanisms, service interruptions, incompatibilities, or data loss may occur.
+The initial scan (Step 2/4) is strictly read-only. However, if you actively enable or revert remediation steps in the subsequent TUI menu (Steps 3/4 & 4/4: Telegram bot, package updates, PHP branch switch, Docker Compose stop/recreate, config changes, quarantine), the script modifies the live system. Despite built-in backups and rollback mechanisms, service interruptions, incompatibilities, or data loss may occur.
 
 ${C}${B}4. Limitation of Liability (pursuant to German law, §§ 521, 599, 276 BGB)${N}
 Any liability of the authors or contributors for direct or indirect damages, consequential damages, data loss, or system downtime is excluded, unless caused by intent, gross negligence, or mandatory statutory liability.
@@ -280,7 +289,7 @@ By pressing ${G}${B}[Enter]${N} or ${G}${B}[y]${N}, you confirm that you are aut
 EOF
 )
     else
-      step_title="Schritt 1/3 - Rechtlicher Hinweis "
+      step_title="Schritt 1/4 - Rechtlicher Hinweis "
       box_title="Haftungsausschluss & Nutzungsbedingungen (Disclaimer)"
       status_line=" Bitte sorgfaeltig lesen. Mit [Enter] oder [j] akzeptieren Sie und starten die lesende Systempruefung."
       key_line=" Pfeile/Bild: scrollen | Enter/j: ICH AKZEPTIERE (Scan starten) | l: Sprache (DE/EN) | q: Abbruch"
@@ -296,7 +305,7 @@ ${C}${B}2. Keine Garantie auf Erkennung oder vollstaendigen Schutz${N}
 Ein Scan ohne Treffer ("0 CRIT / 0 WARN") ist KEIN Beweis dafuer, dass das System nicht kompromittiert wurde. Ebenso ersetzen temporaere Workarounds laut BSI (BITS-H Nr. 2026-297981-1132) keinen offiziellen Sicherheits-Patch.
 
 ${C}${B}3. Systemeingriffe, Rueckabwicklung & Betriebsrisiken${N}
-Der initiale Scan (Schritt 2/3) arbeitet rein lesend. Wenn Sie im anschliessenden TUI-Menue (Schritt 3/3) jedoch aktiv Massnahmen aktivieren oder deaktivieren (z. B. Paket-Updates, PHP-Branch-Wechsel, Docker-Compose-Stopp/Recreate, Konfigurationsaenderungen, Quarantaene oder deren Rueckabwicklung), greift das Skript tief in das laufende System ein. Trotz integrierter Backups und Rollback-Mechanismen kann es zu Dienstunterbrechungen, Inkompatibilitaeten oder Datenverlust kommen.
+Der initiale Scan (Schritt 2/4) arbeitet rein lesend. Wenn Sie im anschliessenden TUI-Menue (Schritt 3/4 & 4/4) jedoch aktiv Massnahmen aktivieren oder deaktivieren (z. B. Telegram-Bot, Paket-Updates, PHP-Branch-Wechsel, Docker-Compose-Stopp/Recreate, Konfigurationsaenderungen, Quarantaene oder deren Rueckabwicklung), greift das Skript tief in das laufende System ein. Trotz integrierter Backups und Rollback-Mechanismen kann es zu Dienstunterbrechungen, Inkompatibilitaeten oder Datenverlust kommen.
 
 ${C}${B}4. Haftungsbeschraenkung (gemaess deutschem Recht, §§ 521, 599, 276 BGB)${N}
 Jegliche Haftung der Autoren, Bereitsteller oder Mitwirkenden fuer direkte oder indirekte Schaeden, Folgeschaeden, Datenverlust, Systemausfaelle oder entgangenen Gewinn ist ausgeschlossen, soweit diese nicht auf Vorsatz oder grober Fahrlaessigkeit beruhen oder eine zwingende gesetzliche Haftung besteht.
@@ -2729,42 +2738,91 @@ undo_quarantine() {
   alog "Rückabwicklung #12: $count Datei(en) aus Quarantäne wiederhergestellt"
 }
 
-# --- Maßnahme 13: auditd-Überwachung & Rückabwicklung ---
+# --- Maßnahme 13: auditd-Überwachung & Rückabwicklung (inkl. Telegram-Option) ---
+
+AUDIT_TG_WANT=""
 
 act_auditd() {
   if ! command -v auditctl >/dev/null 2>&1; then
-    warn "auditd ist nicht installiert (Debian/Ubuntu: apt install auditd). Danach erneut wählen."; return 0
+    if command -v apt-get >/dev/null 2>&1 && confirm "auditd ist noch nicht installiert. Jetzt via apt-get installieren?"; then
+      apt-get update -qq 2>/dev/null || true
+      DEBIAN_FRONTEND=noninteractive apt-get install -y auditd audispd-plugins || return 1
+    else
+      warn "auditd ist nicht installiert (Debian/Ubuntu: apt install auditd). Danach erneut wählen."
+      return 0
+    fi
   fi
   local u uid users=()
   mapfile -t users < <(web_users)
   [ "${#users[@]}" -gt 0 ] || { warn "Keine Webserver-User gefunden."; return 0; }
-  explain "Überwachung: Prozessstarts durch Webserver-User mit auditd protokollieren" "niedrig-mittel" \
-    "Legt $AUDIT_RULE an (execve b64 & b32 durch: ${users[*]}) und lädt die Regeln" \
-    "Erkennt Shell-Starts durch PHP - das wichtigste verhaltensbasierte Signal. Rein beobachtend, blockiert nichts." \
-    "Checkbox [13] in der TUI wieder abwählen (löscht $AUDIT_RULE und lädt Regeln neu)"
-  confirm "Audit-Regel anlegen?" || return 0
-  ensure_backup || return 0
-  { echo "## php2shell-check.sh: Prozessstarts durch Webserver-User (Schlüssel php2shell_exec)"
-    for u in "${users[@]}"; do
-      uid=$(id -u "$u")
-      echo "-a always,exit -F arch=b64 -S execve -F uid=$uid -k php2shell_exec"
-      echo "-a always,exit -F arch=b32 -S execve -F uid=$uid -k php2shell_exec"
-    done; } > "$AUDIT_RULE"
-  if augenrules --load >/dev/null 2>&1 || auditctl -R "$AUDIT_RULE" >/dev/null 2>&1; then
-    ok "Audit-Regel aktiv ($AUDIT_RULE)"
-    alog "auditd-Regel angelegt"
+
+  if [ ! -f "$AUDIT_RULE" ]; then
+    explain "Überwachung: Prozessstarts durch Webserver-User mit auditd protokollieren" "niedrig-mittel" \
+      "Legt $AUDIT_RULE an (execve b64 & b32 durch: ${users[*]}) und lädt die Regeln" \
+      "Erkennt Shell-Starts durch PHP - das wichtigste verhaltensbasierte Signal. Rein beobachtend, blockiert nichts." \
+      "Checkbox [13] in der TUI wieder abwählen (löscht $AUDIT_RULE und lädt Regeln neu)"
+    confirm "Audit-Regel ($AUDIT_RULE) anlegen?" || return 0
+    ensure_backup || return 0
+    { echo "## php2shell-check.sh: Prozessstarts durch Webserver-User (Schlüssel php2shell_exec)"
+      for u in "${users[@]}"; do
+        uid=$(id -u "$u")
+        echo "-a always,exit -F arch=b64 -S execve -F uid=$uid -k php2shell_exec"
+        echo "-a always,exit -F arch=b32 -S execve -F uid=$uid -k php2shell_exec"
+      done; } > "$AUDIT_RULE"
+    if augenrules --load >/dev/null 2>&1 || auditctl -R "$AUDIT_RULE" >/dev/null 2>&1; then
+      ok "Audit-Regel aktiv ($AUDIT_RULE)"
+      alog "auditd-Regel angelegt"
+    else
+      warn "Regel geschrieben, aber augenrules --load meldete einen Fehler - 'auditctl -l' prüfen."
+    fi
   else
-    warn "Regel geschrieben, aber augenrules --load meldete einen Fehler - 'auditctl -l' prüfen."
+    ok "Audit-Regel ($AUDIT_RULE) ist bereits eingerichtet."
   fi
+
+  # Immer abfragen bzw. umsetzen, ob für auditd eine Telegram-Benachrichtigung gewünscht ist (auch wenn auditd schon aktiv war!)
+  local want_tg="${AUDIT_TG_WANT:-}"
+  if [ -z "$want_tg" ]; then
+    if confirm "Sollen verdächtige Prozessstarts (auditd php2shell_exec) per Telegram-Bot gemeldet werden?"; then
+      want_tg="1"
+    else
+      want_tg="0"
+    fi
+  fi
+
+  if [ "$want_tg" = "1" ]; then
+    TG_AUDIT=1
+    if ! tg_is_configured && [ -z "$TG_TOKEN_IN" ]; then
+      info "Für die auditd-Telegram-Benachrichtigung werden noch Bot-Token & Chat-ID benötigt:"
+      tui_telegram_prompt_cli
+    fi
+    if [ -n "$TG_TOKEN_IN" ] || tg_is_configured; then
+      TG_ON=1
+      TG_AUDIT=1
+      act_telegram
+      tg_auditwatch_install
+    else
+      warn "Telegram ist nicht konfiguriert - auditd protokolliert vorerst nur lokal in /var/log/audit/audit.log."
+    fi
+  else
+    TG_AUDIT=0
+    tg_auditwatch_remove
+    if [ -r "$TG_CONF" ]; then
+      tg_conf_write "$(tg_conf_get TG_TOKEN)" "$(tg_conf_get TG_CHAT_ID)" "$(tg_conf_get TG_LABEL)" \
+        "$(tg_conf_get TG_FAIL2BAN)" "$(tg_conf_get TG_RKHUNTER)" "$(tg_conf_get TG_CLAMAV)" "0"
+    fi
+    info "auditd-Telegram-Benachrichtigung deaktiviert (lokale Protokollierung in /var/log/audit/audit.log aktiv)."
+  fi
+  AUDIT_TG_WANT=""
 }
 
 undo_auditd() {
   [ -f "$AUDIT_RULE" ] || { info "Keine Audit-Regel ($AUDIT_RULE) vorhanden."; return 0; }
   explain "Rückabwicklung #13: auditd-Überwachungsregel ($AUDIT_RULE) entfernen" "niedrig" \
-    "Löscht $AUDIT_RULE und lädt die Audit-Regeln neu (augenrules --load / auditctl -D -k php2shell_exec)" \
+    "Löscht $AUDIT_RULE, stoppt ggf. it-reinbek-auditwatch und lädt die Audit-Regeln neu (augenrules --load / auditctl -D -k php2shell_exec)" \
     "Prozessstarts durch Webserver-User werden nicht mehr gesondert unter 'php2shell_exec' protokolliert." \
     "Checkbox [13] wieder aktivieren"
   confirm "Audit-Regel ($AUDIT_RULE) jetzt entfernen?" || return 0
+  tg_auditwatch_remove
   rm -f -- "$AUDIT_RULE"
   auditctl -D -k php2shell_exec >/dev/null 2>&1 || true
   command -v augenrules >/dev/null 2>&1 && augenrules --load >/dev/null 2>&1 || true
@@ -2787,12 +2845,486 @@ act_undo() {
     "Einzelne Checkboxen [7], [8] oder [13] wieder aktivieren"
   confirm "Alle genannten Workarounds jetzt zurücknehmen?" || return 0
   ensure_backup || return 0
+  tg_auditwatch_remove
   for f in ${files[@]+"${files[@]}"}; do rm -f -- "$f" && info "entfernt: $f"; done
   for pf in ${pools[@]+"${pools[@]}"}; do sed -i "/^; $MARK_MEM\$/,+1d" "$pf" && info "bereinigt: $pf"; done
   auditctl -D -k php2shell_exec >/dev/null 2>&1 || true
   command -v augenrules >/dev/null 2>&1 && augenrules --load >/dev/null 2>&1
   alog "Alle temporären Workarounds zurückgenommen"
   if confirm "PHP-/Webserver-Dienste jetzt direkt neu starten (Maßnahme 10)?"; then act_restart; fi
+}
+
+# --- Maßnahme 18: Telegram-Bot & sichere Baustein-Benachrichtigungen (fail2ban, rkhunter, ClamAV, auditd) ---
+
+TG_CONF="${TG_CONF:-/etc/it-reinbek/telegram.conf}"
+TG_NOTIFY="${TG_NOTIFY:-/usr/local/sbin/it-reinbek-notify}"
+TG_ON=0
+TG_CUR=0
+TG_ASKED_UPFRONT=0
+TG_TOKEN_IN=""
+TG_CHAT_IN=""
+TG_LABEL_IN=""
+TG_F2B=1
+TG_RKH=1
+TG_CLAM=1
+TG_AUDIT=1
+TG_VERIFY=""
+TG_HTTP=""
+TG_BODY=""
+
+tg_valid_token() { [[ "$1" =~ ^[0-9]{6,12}:[A-Za-z0-9_-]{30,50}$ ]]; }
+tg_valid_chat() { [[ "$1" =~ ^(-?[0-9]+|@[A-Za-z0-9_]{5,})$ ]]; }
+tg_valid_label() { local re='^[A-Za-z0-9._ -]{0,40}$'; [[ "$1" =~ $re ]]; }
+tg_conf_get() { [ -r "$TG_CONF" ] || return 0; sed -n "s/^$1=\(.*\)$/\1/p" "$TG_CONF" 2>/dev/null | head -n 1; }
+
+tg_is_configured() {
+  [ -r "$TG_CONF" ] && [ -x "$TG_NOTIFY" ] && tg_valid_token "$(tg_conf_get TG_TOKEN)" && tg_valid_chat "$(tg_conf_get TG_CHAT_ID)"
+}
+
+tg_cat_text() {
+  local t=""
+  [ "${1:-0}" = "1" ] && t="fail2ban"
+  [ "${2:-0}" = "1" ] && t="${t:+$t, }rkhunter"
+  [ "${3:-0}" = "1" ] && t="${t:+$t, }clamav"
+  [ "${4:-0}" = "1" ] && t="${t:+$t, }auditd"
+  if [ "$UI_LANG" = "en" ]; then
+    echo "${t:-none}"
+  else
+    echo "${t:-keine}"
+  fi
+}
+
+tg_api() {
+  local tok="$1" meth="$2" out
+  shift 2
+  TG_HTTP=""; TG_BODY=""
+  command -v curl >/dev/null 2>&1 || return 1
+  out="$(printf 'url = "https://api.telegram.org/bot%s/%s"\n' "$tok" "$meth" \
+    | curl -sS --max-time 10 --proto '=https' --tlsv1.2 -K - -w '\n%{http_code}' "$@" 2>/dev/null)" || return 1
+  TG_HTTP="${out##*$'\n'}"
+  TG_BODY="${out%$'\n'*}"
+  return 0
+}
+
+tg_check_token() {
+  tg_api "$1" getMe || return 2
+  case "$TG_HTTP" in
+    200) case "$TG_BODY" in *'"ok":true'*) return 0 ;; esac; return 1 ;;
+    401|404) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+tg_check_chat() {
+  tg_api "$1" getChat --data-urlencode "chat_id=$2" || return 2
+  case "$TG_HTTP" in
+    200) case "$TG_BODY" in *'"ok":true'*) return 0 ;; esac; return 1 ;;
+    400|403|404) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+tg_init() {
+  TG_CUR=0
+  if [ -r "$TG_CONF" ]; then
+    local tok chat
+    tok="$(tg_conf_get TG_TOKEN)"
+    chat="$(tg_conf_get TG_CHAT_ID)"
+    if tg_valid_token "$tok" && tg_valid_chat "$chat"; then
+      TG_CUR=1
+      TG_ON=1
+    fi
+    [ -z "$TG_TOKEN_IN" ] && TG_TOKEN_IN="$tok"
+    [ -z "$TG_CHAT_IN" ] && TG_CHAT_IN="$chat"
+    [ -z "$TG_LABEL_IN" ] && TG_LABEL_IN="$(tg_conf_get TG_LABEL)"
+    local cf cr cc ca
+    cf="$(tg_conf_get TG_FAIL2BAN)"; [ -n "$cf" ] && TG_F2B="$cf"
+    cr="$(tg_conf_get TG_RKHUNTER)"; [ -n "$cr" ] && TG_RKH="$cr"
+    cc="$(tg_conf_get TG_CLAMAV)";   [ -n "$cc" ] && TG_CLAM="$cc"
+    ca="$(tg_conf_get TG_AUDITD)";   [ -n "$ca" ] && TG_AUDIT="$ca"
+  else
+    [ -z "$TG_TOKEN_IN" ] && TG_TOKEN_IN="${TELEGRAM_BOT_TOKEN:-}"
+    [ -z "$TG_CHAT_IN" ] && TG_CHAT_IN="${TELEGRAM_CHAT_ID:-}"
+    [ -z "$TG_LABEL_IN" ] && TG_LABEL_IN="${TELEGRAM_LABEL:-$(hostname 2>/dev/null || echo server)}"
+    if [ -n "$TG_TOKEN_IN" ] && [ -n "$TG_CHAT_IN" ]; then TG_ON=1; fi
+  fi
+  [ -z "$TG_LABEL_IN" ] && TG_LABEL_IN="$(hostname 2>/dev/null || echo server)"
+  [ -z "$TG_F2B" ] && TG_F2B=1
+  [ -z "$TG_RKH" ] && TG_RKH=1
+  [ -z "$TG_CLAM" ] && TG_CLAM=1
+  [ -z "$TG_AUDIT" ] && TG_AUDIT=1
+}
+
+tg_conf_write() {
+  # $1=token $2=chat $3=label $4=fail2ban $5=rkhunter $6=clamav $7=auditd
+  # Gegen unerlaubten Zugriff geschuetzt: Ordner 700 (root:root), Datei atomar mit umask 077 & chmod 600 (root:root)
+  local tmp dir
+  dir="$(dirname "$TG_CONF")"
+  install -d -m 700 "$dir"
+  chown root:root "$dir" 2>/dev/null || true
+  chmod 700 "$dir" 2>/dev/null || true
+  tmp="$(umask 077; mktemp "${TG_CONF}.XXXXXX")"
+  cat > "$tmp" << TGCONF_EOF
+# IT-Reinbek Telegram-Benachrichtigung (verwaltet von php2shell-check.sh & it-reinbek-haertung.sh, Rechte 600, nur root)
+TG_TOKEN=$1
+TG_CHAT_ID=$2
+TG_LABEL=$3
+TG_FAIL2BAN=${4:-1}
+TG_RKHUNTER=${5:-1}
+TG_CLAMAV=${6:-1}
+TG_AUDITD=${7:-1}
+TGCONF_EOF
+  chmod 600 "$tmp"
+  chown root:root "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$TG_CONF"
+  chmod 600 "$TG_CONF" 2>/dev/null || true
+}
+
+tg_notify_install() {
+  install -d -m 755 "$(dirname "$TG_NOTIFY")"
+  cat > "$TG_NOTIFY" << 'NOTIFY_EOF'
+#!/usr/bin/env bash
+# IT-Reinbek: Zentrale Telegram-Benachrichtigung (für fail2ban, rkhunter, clamav, auditd, php2shell).
+# Aufruf: it-reinbek-notify <fail2ban|rkhunter|clamav|auditd|php2shell|test> <Text ...>
+# Sicherheit: Liest /etc/it-reinbek/telegram.conf (0600 root:root) und übergibt den Bot-Token
+# ausschließlich per stdin (curl -K -) – der Token taucht niemals in ps / /proc/*/cmdline auf!
+# Rate-Limit: Gleiche Meldung max. alle 2 Min., max. 30 Meldungen pro Stunde & Kategorie.
+set -u
+CONF="__CONF__"
+RUN="/run/it-reinbek-notify"
+MAX_PER_HOUR=30
+DEDUP_SEC=120
+
+cat_arg="${1:-}"; shift || true
+text="$*"
+[ -r "$CONF" ] || exit 0
+get() { sed -n "s/^$1=\(.*\)$/\1/p" "$CONF" | head -n 1; }
+token="$(get TG_TOKEN)"; chat="$(get TG_CHAT_ID)"; label="$(get TG_LABEL)"
+case "$cat_arg" in
+  fail2ban)  [ "$(get TG_FAIL2BAN)" = "1" ] || exit 0 ;;
+  rkhunter)  [ "$(get TG_RKHUNTER)" = "1" ] || exit 0 ;;
+  clamav)    [ "$(get TG_CLAMAV)" = "1" ] || exit 0 ;;
+  auditd)    [ "$(get TG_AUDITD)" = "1" ] || exit 0 ;;
+  php2shell) ;;
+  test)      ;;
+  *) echo "Aufruf: $0 <fail2ban|rkhunter|clamav|auditd|php2shell|test> <Text>" >&2; exit 2 ;;
+esac
+re_tok='^[0-9]{6,12}:[A-Za-z0-9_-]{30,50}$'; re_chat='^(-?[0-9]+|@[A-Za-z0-9_]{5,})$'
+[[ "$token" =~ $re_tok ]] || exit 0
+[[ "$chat" =~ $re_chat ]] || exit 0
+[ -n "$text" ] || exit 0
+now="$(date +%s)"
+if [ "$cat_arg" != "test" ]; then
+  mkdir -p "$RUN"; chmod 700 "$RUN"
+  h="$(printf '%s' "$text" | md5sum | cut -d' ' -f1)"
+  if [ -r "$RUN/$cat_arg.last" ]; then
+    read -r lh lt < "$RUN/$cat_arg.last" || true
+    if [ "${lh:-}" = "$h" ] && [ $((now - ${lt:-0})) -lt "$DEDUP_SEC" ]; then exit 0; fi
+  fi
+  printf '%s %s\n' "$h" "$now" > "$RUN/$cat_arg.last"
+  recent="$(awk -v n="$now" '$1 > n-3600' "$RUN/$cat_arg.log" 2>/dev/null | wc -l)"
+  if [ "$recent" -ge "$MAX_PER_HOUR" ]; then
+    [ "$recent" -eq "$MAX_PER_HOUR" ] || exit 0
+    text="Limit von $MAX_PER_HOUR Meldungen pro Stunde erreicht - weitere Meldungen dieser Art werden bis zur vollen Stunde unterdrueckt."
+  fi
+  { awk -v n="$now" '$1 > n-3600' "$RUN/$cat_arg.log" 2>/dev/null; echo "$now"; } > "$RUN/$cat_arg.log.new" \
+    && mv -f "$RUN/$cat_arg.log.new" "$RUN/$cat_arg.log"
+fi
+msg="[${label:-$(hostname)}] $cat_arg: $text"
+tmp="$(umask 077; mktemp)"; chmod 600 "$tmp"; trap 'rm -f "$tmp"' EXIT
+printf '%s' "$msg" | LC_ALL=C tr -d '\000-\010\013-\037\177' | head -c 3500 > "$tmp"
+code="$(printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$token" \
+  | curl -sS --max-time 15 --proto '=https' --tlsv1.2 -K - -o /dev/null -w '%{http_code}' \
+      --data-urlencode "chat_id=$chat" --data-urlencode "text@$tmp" 2>/dev/null || true)"
+if [ "$code" != "200" ]; then
+  logger -t it-reinbek-notify "Telegram-Versand fehlgeschlagen (HTTP ${code:-keine Antwort})"
+  exit 1
+fi
+exit 0
+NOTIFY_EOF
+  sed -i "s#__CONF__#${TG_CONF}#g" "$TG_NOTIFY"
+  chmod 750 "$TG_NOTIFY"
+  chown root:root "$TG_NOTIFY" 2>/dev/null || true
+}
+
+rkhunter_wrapper_install() {
+  cat > /usr/local/sbin/it-reinbek-rkhunter << 'RKW_EOF'
+#!/usr/bin/env bash
+# IT-Reinbek: taeglicher rkhunter-Lauf. Meldet Warnungen/Fehler per Telegram, wenn eingerichtet.
+set -uo pipefail
+LOG=/var/log/rkhunter_cron.log
+NOTIFY="__NOTIFY__"
+TMP="$(mktemp)"; trap 'rm -f "$TMP"' EXIT
+/usr/bin/rkhunter --check --sk > "$TMP" 2>&1; rc=$?
+cat "$TMP" >> "$LOG"
+if [ "$rc" -ne 0 ] && [ -x "$NOTIFY" ]; then
+  W="$(grep -i 'warning' "$TMP" | head -n 15 | cut -c1-200)"
+  "$NOTIFY" rkhunter "rkhunter meldet Warnung oder Fehler (Exit $rc). ${W:-Details: /var/log/rkhunter.log}" || true
+fi
+exit 0
+RKW_EOF
+  sed -i "s#__NOTIFY__#${TG_NOTIFY}#g" /usr/local/sbin/it-reinbek-rkhunter
+  chmod 750 /usr/local/sbin/it-reinbek-rkhunter
+  chown root:root /usr/local/sbin/it-reinbek-rkhunter 2>/dev/null || true
+  if command -v rkhunter >/dev/null 2>&1; then
+    cat > /etc/cron.d/rkhunter-daily << 'RK_EOF'
+0 3 * * * root /usr/local/sbin/it-reinbek-rkhunter
+RK_EOF
+    chmod 644 /etc/cron.d/rkhunter-daily
+  fi
+}
+
+tg_f2b_remove() {
+  local had=0
+  if [ -e /etc/fail2ban/action.d/it-reinbek-notify.conf ] || [ -e /etc/fail2ban/jail.d/it-reinbek-notify.local ]; then had=1; fi
+  rm -f /etc/fail2ban/action.d/it-reinbek-notify.conf /etc/fail2ban/jail.d/it-reinbek-notify.local
+  if [ "$had" = "1" ] && systemctl is-active --quiet fail2ban 2>/dev/null; then systemctl restart fail2ban 2>/dev/null || true; fi
+}
+
+tg_f2b_install() {
+  command -v fail2ban-client >/dev/null 2>&1 || return 0
+  install -d /etc/fail2ban/action.d /etc/fail2ban/jail.d
+  cat > /etc/fail2ban/action.d/it-reinbek-notify.conf << 'F2BA_EOF'
+# IT-Reinbek: Telegram-Meldung bei jeder Sperre
+[Definition]
+actionstart =
+actionstop =
+actioncheck =
+actionban = __NOTIFY__ fail2ban "Ban <ip> (Jail <name>, <failures> Fehlversuche)"
+actionunban =
+F2BA_EOF
+  sed -i "s#__NOTIFY__#${TG_NOTIFY}#g" /etc/fail2ban/action.d/it-reinbek-notify.conf
+  cat > /etc/fail2ban/jail.d/it-reinbek-notify.local << 'F2BJ_EOF'
+# IT-Reinbek: Telegram-Meldung bei jeder Sperre (gilt fuer alle Jails ohne eigene action-Zeile)
+[DEFAULT]
+action = %(action_)s
+         it-reinbek-notify
+F2BJ_EOF
+  if ! fail2ban-client -t >/dev/null 2>&1; then
+    tg_f2b_remove
+    warn "fail2ban-Konfigurationstest fehlgeschlagen - Telegram-Aktion für fail2ban wurde wieder entfernt."
+    return 1
+  fi
+  if systemctl is-active --quiet fail2ban 2>/dev/null; then
+    systemctl restart fail2ban 2>/dev/null || true
+    sleep 1
+    if ! systemctl is-active --quiet fail2ban 2>/dev/null; then
+      tg_f2b_remove
+      systemctl restart fail2ban 2>/dev/null || true
+      warn "fail2ban startete mit Telegram-Aktion nicht - wurde zurückgenommen."
+      return 1
+    fi
+  fi
+  ok "fail2ban-Telegram-Benachrichtigung aktiv (/etc/fail2ban/action.d/it-reinbek-notify.conf)."
+}
+
+tg_clamwatch_remove() {
+  systemctl disable --now it-reinbek-clamwatch >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/it-reinbek-clamwatch.service /usr/local/sbin/it-reinbek-clamwatch
+  command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload 2>/dev/null || true
+}
+
+tg_clamwatch_install() {
+  cat > /usr/local/sbin/it-reinbek-clamwatch << 'CW_EOF'
+#!/usr/bin/env bash
+# IT-Reinbek: meldet ClamAV-Funde (On-Access und clamd) per Telegram. Laeuft als root und liest nur die Logdateien.
+set -u
+NOTIFY="__NOTIFY__"
+LOGS=(/var/log/clamav/clamonacc.log)
+cl="$(awk '$1=="LogFile"{print $2; exit}' /etc/clamav/clamd.conf 2>/dev/null)"
+if [ -n "$cl" ]; then LOGS+=("$cl"); fi
+mkdir -p /var/log/clamav 2>/dev/null || true
+touch /var/log/clamav/clamonacc.log 2>/dev/null || true
+tail -q -n 0 -F "${LOGS[@]}" 2>/dev/null | while IFS= read -r line; do
+  case "$line" in
+    *" FOUND"*) "$NOTIFY" clamav "Fund: ${line:0:300}" || true ;;
+  esac
+done
+CW_EOF
+  sed -i "s#__NOTIFY__#${TG_NOTIFY}#g" /usr/local/sbin/it-reinbek-clamwatch
+  chmod 750 /usr/local/sbin/it-reinbek-clamwatch
+  chown root:root /usr/local/sbin/it-reinbek-clamwatch 2>/dev/null || true
+  cat > /etc/systemd/system/it-reinbek-clamwatch.service << 'CWU_EOF'
+[Unit]
+Description=IT-Reinbek: ClamAV-Funde per Telegram melden
+After=clamav-daemon.service
+
+[Service]
+ExecStart=/usr/local/sbin/it-reinbek-clamwatch
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+CWU_EOF
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl enable --now it-reinbek-clamwatch >/dev/null 2>&1 || warn "it-reinbek-clamwatch konnte nicht gestartet werden."
+}
+
+tg_auditwatch_remove() {
+  systemctl disable --now it-reinbek-auditwatch >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/it-reinbek-auditwatch.service /usr/local/sbin/it-reinbek-auditwatch
+  command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload 2>/dev/null || true
+}
+
+tg_auditwatch_install() {
+  [ -f /var/log/audit/audit.log ] || mkdir -p /var/log/audit 2>/dev/null || true
+  cat > /usr/local/sbin/it-reinbek-auditwatch << 'AW_EOF'
+#!/usr/bin/env bash
+# IT-Reinbek: Überwacht /var/log/audit/audit.log auf php2shell_exec (Shell-/Prozessstarts durch Webserver-User)
+# und meldet Treffer sofort per Telegram-Bot (läuft als root, Token bleibt in 0600 /etc/it-reinbek/telegram.conf).
+set -u
+NOTIFY="__NOTIFY__"
+ALOG="/var/log/audit/audit.log"
+[ -e "$ALOG" ] || touch "$ALOG" 2>/dev/null || true
+tail -q -n 0 -F "$ALOG" 2>/dev/null | while IFS= read -r line; do
+  case "$line" in
+    *'key="php2shell_exec"'*)
+      case "$line" in
+        *'exe="/usr/sbin/php-fpm'*|*'exe="/usr/bin/php'*) continue ;;
+      esac
+      "$NOTIFY" auditd "Verdächtiger Prozessstart durch Webserver-User (php2shell_exec): ${line:0:320}" || true
+      ;;
+  esac
+done
+AW_EOF
+  sed -i "s#__NOTIFY__#${TG_NOTIFY}#g" /usr/local/sbin/it-reinbek-auditwatch
+  chmod 750 /usr/local/sbin/it-reinbek-auditwatch
+  chown root:root /usr/local/sbin/it-reinbek-auditwatch 2>/dev/null || true
+  cat > /etc/systemd/system/it-reinbek-auditwatch.service << 'AWU_EOF'
+[Unit]
+Description=IT-Reinbek: auditd php2shell_exec Prozessstarts per Telegram melden
+After=auditd.service
+
+[Service]
+ExecStart=/usr/local/sbin/it-reinbek-auditwatch
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+AWU_EOF
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl enable --now it-reinbek-auditwatch >/dev/null 2>&1 || warn "it-reinbek-auditwatch konnte nicht gestartet werden."
+  ok "auditd-Telegram-Wächter (it-reinbek-auditwatch.service) aktiviert."
+}
+
+tui_telegram_prompt_cli() {
+  tg_init
+  local tok="$TG_TOKEN_IN" chat="$TG_CHAT_IN" label="${TG_LABEL_IN:-$(hostname)}"
+  printf '\n%s--- Telegram-Bot Zugangsdaten (werden geschützt mit chmod 600 in %s abgelegt) ---%s\n' "$B$C" "$TG_CONF" "$N"
+  tty_read -r -p "Bot-Token (von @BotFather, z.B. 123456789:AA...)${tok:+ [$tok]}: " input_tok || return 1
+  tok="${input_tok:-$tok}"
+  tok="${tok//[[:space:]]/}"
+  if ! tg_valid_token "$tok"; then
+    warn "Ungültiges Bot-Token-Format."
+    return 1
+  fi
+  tty_read -r -p "Chat-ID (Zahl, bei Gruppe mit Minus, z.B. -100...)${chat:+ [$chat]}: " input_chat || return 1
+  chat="${input_chat:-$chat}"
+  chat="${chat//[[:space:]]/}"
+  if ! tg_valid_chat "$chat"; then
+    warn "Ungültiges Chat-ID-Format."
+    return 1
+  fi
+  tty_read -r -p "Server-Name in Meldungen [$label]: " input_lbl || return 1
+  label="${input_lbl:-$label}"
+  TG_TOKEN_IN="$tok"
+  TG_CHAT_IN="$chat"
+  TG_LABEL_IN="$label"
+  TG_ON=1
+  return 0
+}
+
+act_telegram() {
+  tg_init
+  local tok chat label f2b rkh clam aud
+  if [ -n "$TG_TOKEN_IN" ] && [ -n "$TG_CHAT_IN" ]; then
+    tok="$TG_TOKEN_IN"
+    chat="$TG_CHAT_IN"
+    label="${TG_LABEL_IN:-$(hostname)}"
+    f2b="${TG_F2B:-1}"
+    rkh="${TG_RKH:-1}"
+    clam="${TG_CLAM:-1}"
+    aud="${TG_AUDIT:-1}"
+  elif [ -r "$TG_CONF" ]; then
+    tok="$(tg_conf_get TG_TOKEN)"
+    chat="$(tg_conf_get TG_CHAT_ID)"
+    label="$(tg_conf_get TG_LABEL)"
+    f2b="$(tg_conf_get TG_FAIL2BAN)"
+    rkh="$(tg_conf_get TG_RKHUNTER)"
+    clam="$(tg_conf_get TG_CLAMAV)"
+    aud="$(tg_conf_get TG_AUDITD)"
+  else
+    tui_telegram_prompt_cli || return 1
+    tok="$TG_TOKEN_IN"; chat="$TG_CHAT_IN"; label="$TG_LABEL_IN"
+    f2b="${TG_F2B:-1}"; rkh="${TG_RKH:-1}"; clam="${TG_CLAM:-1}"; aud="${TG_AUDIT:-1}"
+  fi
+
+  tg_valid_token "$tok" || { crit "Telegram: Bot-Token hat ein ungültiges Format."; return 1; }
+  tg_valid_chat "$chat" || { crit "Telegram: Chat-ID hat ein ungültiges Format."; return 1; }
+  tg_valid_label "$label" || label="$(hostname)"
+
+  if ! command -v curl >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq 2>/dev/null || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates || true
+  fi
+
+  tg_conf_write "$tok" "$chat" "$label" "${f2b:-1}" "${rkh:-1}" "${clam:-1}" "${aud:-1}"
+  tg_notify_install
+  ok "Telegram-Konfiguration sicher gespeichert in $TG_CONF (Ordner 0700, Datei 0600 root:root) & $TG_NOTIFY (0750)."
+  info "Einstellungen für fail2ban (TG_FAIL2BAN=${f2b:-1}) und rkhunter (TG_RKHUNTER=${rkh:-1}) sind für alle Skripte vorgehalten."
+
+  # Bausteine direkt anbinden, falls installiert/aktiv
+  if [ "${f2b:-1}" = "1" ] && command -v fail2ban-client >/dev/null 2>&1; then
+    tg_f2b_install
+  else
+    tg_f2b_remove
+  fi
+
+  rkhunter_wrapper_install
+
+  clam_mode_detect
+  if [ "${clam:-1}" = "1" ] && [ "$CLAM_MODE_CUR" = "live" ]; then
+    tg_clamwatch_install
+  else
+    tg_clamwatch_remove
+  fi
+  if [ "$CLAM_MODE_CUR" = "cron" ] || [ -x /usr/local/sbin/clamav-scan.sh ]; then
+    clam_write_scan_script
+  fi
+
+  if [ "${aud:-1}" = "1" ] && [ -f "$AUDIT_RULE" ]; then
+    tg_auditwatch_install
+  else
+    tg_auditwatch_remove
+  fi
+
+  if "$TG_NOTIFY" test "PHP2Shell-Auditor & Server-Schutz: Benachrichtigungen aktiv fuer $(tg_cat_text "${f2b:-1}" "${rkh:-1}" "${clam:-1}" "${aud:-1}") (CRIT:$CRIT WARN:$WARN)"; then
+    ok "Telegram: Testnachricht erfolgreich gesendet - bitte im Chat prüfen!"
+  else
+    warn "Telegram: Testnachricht konnte nicht gesendet werden (bitte Token, Chat-ID, /start beim Bot und Internetzugang prüfen)."
+  fi
+  TG_CUR=1
+  TG_ON=1
+  alog "Telegram-Benachrichtigungen eingerichtet für: $(tg_cat_text "${f2b:-1}" "${rkh:-1}" "${clam:-1}" "${aud:-1}")"
+}
+
+undo_telegram() {
+  explain "Rückabwicklung #18: Telegram-Benachrichtigungen & gespeicherte Zugangsdaten entfernen" "niedrig" \
+    "Stoppt it-reinbek-clamwatch & it-reinbek-auditwatch, entfernt die fail2ban-Action und löscht $TG_CONF sowie $TG_NOTIFY." \
+    "Es werden keine Telegram-Meldungen mehr für fail2ban, rkhunter, ClamAV oder auditd versendet." \
+    "Checkbox [18] wieder aktivieren"
+  confirm "Telegram-Benachrichtigungen und Zugangsdaten ($TG_CONF) jetzt entfernen?" || return 0
+  tg_f2b_remove
+  tg_clamwatch_remove
+  tg_auditwatch_remove
+  rm -f "$TG_CONF" "$TG_NOTIFY"
+  rm -rf /run/it-reinbek-notify
+  TG_CUR=0
+  TG_ON=0
+  ok "Telegram-Benachrichtigungen und Zugangsdaten ($TG_CONF) vollständig entfernt."
+  alog "Rückabwicklung #18: Telegram entfernt"
 }
 
 # --- Maßnahme 17: ClamAV Malwareschutz (Echtzeit clamd+clamonacc vs. Zeitplan/Cronjob) ---
@@ -2806,6 +3338,7 @@ CLAM_REC="none"
 CLAM_REC_WHY=""
 CLAM_RAM_TXT=""
 CLAM_EFF_MB=0
+CLAM_TG_WANT=""
 
 mem_mb() {
   awk -v k="$1:" '$1==k {printf "%d", $2/1024; f=1; exit} END{if(!f) print 0}' /proc/meminfo 2>/dev/null
@@ -2877,6 +3410,12 @@ set -uo pipefail
 LOG=/var/log/clamav/scan.log
 FOUND=/var/log/clamav/last-infected.txt
 OKSTAMP=/var/log/clamav/last-scan-ok
+NOTIFY="__NOTIFY__"
+
+tg() {
+  [ -x "$NOTIFY" ] || return 0
+  "$NOTIFY" clamav "$1" 2>/dev/null || true
+}
 
 PATHS=()
 for p in /var/www /home /root /opt /srv /tmp /var/tmp /var/lib/docker/volumes; do
@@ -2903,6 +3442,8 @@ case "$rc" in
     mv "$TMP" "$FOUND"
     chmod 640 "$FOUND"
     logger -p auth.crit -t clamav-scan "INFECTED FILES FOUND - siehe $FOUND"
+    hits="$(grep -E 'FOUND$' "$FOUND" 2>/dev/null | head -n 15)"
+    tg "$(printf 'Viren-/Webshell-Fund beim geplanten ClamAV-Scan!\nLog: %s\n\n%s' "$FOUND" "$hits")"
     exit 1
     ;;
   *)
@@ -2912,6 +3453,7 @@ case "$rc" in
     ;;
 esac
 CLS_EOF
+  sed -i "s|__NOTIFY__|${TG_NOTIFY}|g" /usr/local/sbin/clamav-scan.sh
   chmod 750 /usr/local/sbin/clamav-scan.sh
 }
 
@@ -3110,15 +3652,55 @@ act_clamav() {
   esac
   CLAM_MODE_CUR="$mode"
   CLAM_MODE_WANT="$mode"
-  alog "ClamAV eingerichtet in Betriebsart: $mode"
+
+  # Immer abfragen bzw. umsetzen, ob für ClamAV eine Telegram-Benachrichtigung gewünscht ist
+  local want_tg="${CLAM_TG_WANT:-}"
+  if [ -z "$want_tg" ]; then
+    if confirm "Sollen Viren-/Webshell-Funde von ClamAV per Telegram-Bot gemeldet werden?"; then
+      want_tg="1"
+    else
+      want_tg="0"
+    fi
+  fi
+
+  if [ "$want_tg" = "1" ]; then
+    TG_CLAM=1
+    if ! tg_is_configured && [ -z "$TG_TOKEN_IN" ]; then
+      info "Für die ClamAV-Telegram-Benachrichtigung werden noch Bot-Token & Chat-ID benötigt:"
+      tui_telegram_prompt_cli
+    fi
+    if [ -n "$TG_TOKEN_IN" ] || tg_is_configured; then
+      TG_ON=1
+      TG_CLAM=1
+      act_telegram
+      if [ "$mode" = "live" ]; then
+        tg_clamwatch_install
+      else
+        tg_clamwatch_remove
+      fi
+    else
+      warn "Telegram ist nicht konfiguriert - ClamAV protokolliert vorerst nur lokal in /var/log/clamav."
+    fi
+  else
+    TG_CLAM=0
+    tg_clamwatch_remove
+    if [ -r "$TG_CONF" ]; then
+      tg_conf_write "$(tg_conf_get TG_TOKEN)" "$(tg_conf_get TG_CHAT_ID)" "$(tg_conf_get TG_LABEL)" \
+        "$(tg_conf_get TG_FAIL2BAN)" "$(tg_conf_get TG_RKHUNTER)" "0" "$(tg_conf_get TG_AUDITD)"
+    fi
+    info "ClamAV-Telegram-Benachrichtigung deaktiviert (lokale Protokollierung in /var/log/clamav aktiv)."
+  fi
+  CLAM_TG_WANT=""
+  alog "ClamAV eingerichtet in Betriebsart: $mode (Telegram: $TG_CLAM)"
 }
 
 undo_clamav() {
   explain "Rückabwicklung #17: ClamAV Echtzeit- & Cronjob-Überwachung deaktivieren" "niedrig" \
-    "Stoppt und deaktiviert clamd, clamonacc sowie den täglichen clamav-scan.timer/Cronjob und stellt clamd.conf wieder her (Pakete bleiben installiert)." \
+    "Stoppt und deaktiviert clamd, clamonacc, it-reinbek-clamwatch sowie den täglichen clamav-scan.timer/Cronjob und stellt clamd.conf wieder her (Pakete bleiben installiert)." \
     "Es findet keine automatische ClamAV-Überwachung auf Webshells/Malware mehr statt." \
     "Checkbox [17] wieder aktivieren"
   confirm "ClamAV-Dienste und Zeitplan-Scans jetzt deaktivieren?" || return 0
+  tg_clamwatch_remove
   clam_stop_live
   clam_stop_cron
   systemctl disable --now clamav-freshclam >/dev/null 2>&1 || true
@@ -3340,7 +3922,7 @@ declare -a M_TITLE=() M_CAT=() M_RISK=() M_WHAT=() M_IMPACT=() M_UNDO=() M_ACTIV
 
 detect_live_states() {
   local i pf
-  for i in {1..17}; do M_ACTIVE[$i]=0; done
+  for i in {1..18}; do M_ACTIVE[$i]=0; done
 
   ls -d /root/php2shell-evidence-* >/dev/null 2>&1 && M_ACTIVE[1]=1
   ls -d /root/php2shell-backup-* >/dev/null 2>&1 && M_ACTIVE[2]=1
@@ -3379,21 +3961,27 @@ detect_live_states() {
   else
     [ -z "$CLAM_MODE_WANT" ] && CLAM_MODE_WANT="$CLAM_REC"
   fi
+
+  tg_init
+  if [ "$TG_CUR" -eq 1 ]; then
+    M_ACTIVE[18]=1
+  fi
 }
 
 sync_selection_with_active() {
   local i
   detect_live_states
-  for i in {1..17}; do
+  for i in {1..18}; do
     M_SEL[$i]="${M_ACTIVE[$i]}"
   done
+  [ "$TG_ON" -eq 1 ] && M_SEL[18]=1
   load_menu_texts 2>/dev/null || true
 }
 
 load_menu_texts() {
   clam_recommend
   clam_mode_detect
-  local clam_mode_lbl clam_rec_lbl
+  local clam_mode_lbl clam_rec_lbl aud_tg_lbl tg_stat_lbl
   if [ "$UI_LANG" = "en" ]; then
     case "${CLAM_MODE_WANT:-$CLAM_MODE_CUR}" in
       live) clam_mode_lbl="Real-time (clamd)" ;;
@@ -3405,6 +3993,16 @@ load_menu_texts() {
       cron) clam_rec_lbl="Scheduled/Cron (cron)" ;;
       *)    clam_rec_lbl="No ClamAV (low RAM)" ;;
     esac
+    if systemctl is-active --quiet it-reinbek-auditwatch.service 2>/dev/null || [ "${AUDIT_TG_WANT:-}" = "1" ]; then
+      aud_tg_lbl=" + TG"
+    else
+      aud_tg_lbl=""
+    fi
+    if [ "$TG_ON" -eq 1 ] || [ "$TG_CUR" -eq 1 ]; then
+      tg_stat_lbl="$(tg_cat_text "${TG_F2B:-1}" "${TG_RKH:-1}" "${TG_CLAM:-1}" "${TG_AUDIT:-1}")"
+    else
+      tg_stat_lbl="Configure [t]"
+    fi
   else
     case "${CLAM_MODE_WANT:-$CLAM_MODE_CUR}" in
       live) clam_mode_lbl="Echtzeit (clamd)" ;;
@@ -3416,6 +4014,16 @@ load_menu_texts() {
       cron) clam_rec_lbl="Zeitplan/Cronjob (cron)" ;;
       *)    clam_rec_lbl="Kein ClamAV (wenig RAM)" ;;
     esac
+    if systemctl is-active --quiet it-reinbek-auditwatch.service 2>/dev/null || [ "${AUDIT_TG_WANT:-}" = "1" ]; then
+      aud_tg_lbl=" + TG"
+    else
+      aud_tg_lbl=""
+    fi
+    if [ "$TG_ON" -eq 1 ] || [ "$TG_CUR" -eq 1 ]; then
+      tg_stat_lbl="$(tg_cat_text "${TG_F2B:-1}" "${TG_RKH:-1}" "${TG_CLAM:-1}" "${TG_AUDIT:-1}")"
+    else
+      tg_stat_lbl="Einrichten [t]"
+    fi
   fi
 
   if [ "$UI_LANG" = "en" ]; then
@@ -3491,11 +4099,11 @@ load_menu_texts() {
     M_IMPACT[12]="In case of a false positive, the affected file stops working until restored."
     M_UNDO[12]="Uncheck [x] -> [ ] and press [Enter]: Restores all quarantined files with original permissions and ownership."
 
-    M_CAT[13]="IV. Cleanup & Print"; M_TITLE[13]="Enable auditd monitoring"
-    M_RISK[13]="LOW (logging only, blocks nothing)"
-    M_WHAT[13]="Configures an auditd rule (/etc/audit/rules.d/99-php2shell.rules) logging all program/shell executions (execve 64-bit & 32-bit) by webserver users (www-data, apache, nginx) under key 'php2shell_exec'."
-    M_IMPACT[13]="Writes audit log entries when PHP spawns processes (inspect via: ausearch -k php2shell_exec)."
-    M_UNDO[13]="Uncheck [x] -> [ ] and press [Enter]: Deletes /etc/audit/rules.d/99-php2shell.rules and unloads the kernel rule."
+    M_CAT[13]="IV. Cleanup & Print"; M_TITLE[13]="auditd monitoring${aud_tg_lbl}"
+    M_RISK[13]="LOW (logging only, blocks nothing; optional Telegram alert)"
+    M_WHAT[13]="Configures an auditd rule (/etc/audit/rules.d/99-php2shell.rules) logging all program/shell executions (execve 64-bit & 32-bit) by webserver users (www-data, apache, nginx) under key 'php2shell_exec'. Press [Space] on #13 to choose whether Telegram alerts (it-reinbek-auditwatch) should be active - even if auditd is already enabled!"
+    M_IMPACT[13]="Writes audit log entries when PHP spawns processes (inspect via: ausearch -k php2shell_exec) and optionally sends immediate Telegram notifications."
+    M_UNDO[13]="Press [Space] on #13 (or uncheck) and press [Enter]: Allows disabling Telegram alerts or removing /etc/audit/rules.d/99-php2shell.rules completely."
 
     M_CAT[14]="IV. Cleanup & Print"; M_TITLE[14]="Revert all temporary workarounds"
     M_RISK[14]="LOW-MEDIUM (restores original config for #7, #8, #13)"
@@ -3517,9 +4125,15 @@ load_menu_texts() {
 
     M_CAT[17]="IV. Cleanup & Print"; M_TITLE[17]="ClamAV protection ($clam_mode_lbl)"
     M_RISK[17]="LOW-MEDIUM (report-only On-Access or nightly Cron/Timer)"
-    M_WHAT[17]="Configures ClamAV malware/webshell scanning in either Real-time mode (clamd + clamonacc On-Access for /var/www, /home, /opt, /srv) or Scheduled Cron/Timer mode (03:30 daily without resident daemon). Press [Space] or [c] to open the mode selector!"
+    M_WHAT[17]="Configures ClamAV malware/webshell scanning in either Real-time mode (clamd + clamonacc On-Access for /var/www, /home, /opt, /srv) or Scheduled Cron/Timer mode (03:30 daily without resident daemon), including optional Telegram alerts. Press [Space] or [c] to open the mode selector!"
     M_IMPACT[17]="${CLAM_RAM_TXT}. RAM-based recommendation: ${clam_rec_lbl} (${CLAM_REC_WHY})"
-    M_UNDO[17]="Uncheck [x] -> [ ] (or choose 'No ClamAV' in dialog) and press [Enter]: Stops and disables clamd, clamonacc, and clamav-scan.timer."
+    M_UNDO[17]="Uncheck [x] -> [ ] (or choose 'No ClamAV' in dialog) and press [Enter]: Stops and disables clamd, clamonacc, it-reinbek-clamwatch, and clamav-scan.timer."
+
+    M_CAT[18]="IV. Cleanup & Print"; M_TITLE[18]="Telegram Bot ($tg_stat_lbl)"
+    M_RISK[18]="LOW (outbound HTTPS to api.telegram.org only)"
+    M_WHAT[18]="Stores Telegram Bot credentials (Token, Chat-ID, Server Label) and per-component notification flags for fail2ban, rkhunter, ClamAV, and auditd in /etc/it-reinbek/telegram.conf (mode 0600 root:root in 0700 dir) and installs /usr/local/sbin/it-reinbek-notify (0750, token passed via curl stdin). Press [Space] or [t] to configure!"
+    M_IMPACT[18]="Credentials are protected against unauthorized access and shared with the IT-Reinbek Linux Hardening script (fail2ban/rkhunter/ClamAV/auditd)."
+    M_UNDO[18]="Uncheck [x] -> [ ] (or disable in [t] dialog) and press [Enter]: Removes /etc/it-reinbek/telegram.conf, /usr/local/sbin/it-reinbek-notify, and all notification watchers."
   else
     M_CAT[1]="I. Forensik & Sicherung"; M_TITLE[1]="Beweise sichern (Logs/RAM/Locks)"
     M_RISK[1]="KEINE ÄNDERUNG (nur lesend, legt Ordner in /root an)"
@@ -3593,11 +4207,11 @@ load_menu_texts() {
     M_IMPACT[12]="Bei einem Fehlalarm (False Positive) funktioniert die betroffene Datei nicht mehr, bis sie zurückverschoben wird."
     M_UNDO[12]="Haken [x] -> [ ] abwählen und [Enter] drücken: Stellt alle verschobenen Dateien inkl. Originalrechten und Besitzer wieder am Ursprungsort her."
 
-    M_CAT[13]="IV. Bereinigung & Druck"; M_TITLE[13]="auditd-Überwachung aktivieren"
-    M_RISK[13]="NIEDRIG (rein protokollierend, blockiert nichts)"
-    M_WHAT[13]="Richtet eine auditd-Regel (/etc/audit/rules.d/99-php2shell.rules) ein, die alle Programm-/Shell-Starts (execve 64-Bit & 32-Bit) durch Webserver-Benutzer (www-data, apache, nginx) mit dem Schlüssel 'php2shell_exec' protokolliert."
-    M_IMPACT[13]="Erzeugt Audit-Log-Einträge bei Prozessstarts durch PHP (Auswertung mit: ausearch -k php2shell_exec)."
-    M_UNDO[13]="Haken [x] -> [ ] abwählen und [Enter] drücken: Löscht /etc/audit/rules.d/99-php2shell.rules und entlädt die Regel im Kernel."
+    M_CAT[13]="IV. Bereinigung & Druck"; M_TITLE[13]="auditd-Überwachung${aud_tg_lbl}"
+    M_RISK[13]="NIEDRIG (rein protokollierend, optional mit Telegram-Alarm)"
+    M_WHAT[13]="Richtet eine auditd-Regel (/etc/audit/rules.d/99-php2shell.rules) ein, die alle Programm-/Shell-Starts (execve 64-Bit & 32-Bit) durch Webserver-Benutzer (www-data, apache, nginx) mit dem Schlüssel 'php2shell_exec' protokolliert. Mit [Leertaste] auf #13 immer wählbar, ob Telegram-Benachrichtigung (it-reinbek-auditwatch) aktiv sein soll - auch wenn auditd bereits eingerichtet ist!"
+    M_IMPACT[13]="Erzeugt Audit-Log-Einträge bei Prozessstarts durch PHP (Auswertung mit: ausearch -k php2shell_exec) und meldet Treffer auf Wunsch sofort per Telegram."
+    M_UNDO[13]="Mit [Leertaste] auf #13 (oder Abwählen) & [Enter]: Telegram-Meldung zu-/abschalten oder /etc/audit/rules.d/99-php2shell.rules komplett entfernen."
 
     M_CAT[14]="IV. Bereinigung & Druck"; M_TITLE[14]="Sammel-Rücknahme aller Workarounds"
     M_RISK[14]="NIEDRIG-MITTEL (stellt Original-Konfig für #7, #8, #13 her)"
@@ -3619,15 +4233,21 @@ load_menu_texts() {
 
     M_CAT[17]="IV. Bereinigung & Druck"; M_TITLE[17]="ClamAV Malwareschutz ($clam_mode_lbl)"
     M_RISK[17]="NIEDRIG-MITTEL (On-Access nur meldend od. Cronjob nachts)"
-    M_WHAT[17]="Richtet ClamAV-Malware-/Webshell-Überwachung wahlweise in Echtzeit (clamd + clamonacc On-Access für /var/www, /home, /opt, /srv) oder als täglichen Cronjob/Timer (03:30 Uhr ohne Dauer-Daemon) ein. Mit [Leertaste] oder [c] Betriebsart wählen!"
+    M_WHAT[17]="Richtet ClamAV-Malware-/Webshell-Überwachung wahlweise in Echtzeit (clamd + clamonacc On-Access für /var/www, /home, /opt, /srv) oder als täglichen Cronjob/Timer (03:30 Uhr ohne Dauer-Daemon) inkl. optionaler Telegram-Meldung ein. Mit [Leertaste] oder [c] Betriebsart & Telegram-Option wählen!"
     M_IMPACT[17]="${CLAM_RAM_TXT}. Vorschlag nach RAM: ${clam_rec_lbl} (${CLAM_REC_WHY})"
-    M_UNDO[17]="Haken [x] -> [ ] abwählen (oder im Dialog 'Kein ClamAV' wählen) und [Enter] drücken: Stoppt und deaktiviert clamd, clamonacc und clamav-scan.timer."
+    M_UNDO[17]="Haken [x] -> [ ] abwählen (oder im Dialog 'Kein ClamAV' wählen) und [Enter] drücken: Stoppt und deaktiviert clamd, clamonacc, it-reinbek-clamwatch und clamav-scan.timer."
+
+    M_CAT[18]="IV. Bereinigung & Druck"; M_TITLE[18]="Telegram-Bot ($tg_stat_lbl)"
+    M_RISK[18]="NIEDRIG (nur ausgehend HTTPS an api.telegram.org)"
+    M_WHAT[18]="Fragt Bot-Token, Chat-ID und Server-Label ab und speichert sie inkl. Baustein-Auswahl für fail2ban, rkhunter, ClamAV und auditd zugriffsgeschützt in /etc/it-reinbek/telegram.conf (Ordner 0700, Datei 0600 root:root) sowie /usr/local/sbin/it-reinbek-notify (0750, Token per Stdin). Mit [Leertaste] oder [t] konfigurieren!"
+    M_IMPACT[18]="Zugangsdaten sind gegen unbefugtes Auslesen geschützt (kein Token in ps/proc) und sofort auch für fail2ban & rkhunter im IT-Reinbek-Härtungsskript vorgehalten."
+    M_UNDO[18]="Haken [x] -> [ ] abwählen (oder im [t]-Dialog deaktivieren) und [Enter] drücken: Entfernt /etc/it-reinbek/telegram.conf, /usr/local/sbin/it-reinbek-notify und alle Watcher."
   fi
 }
 
 init_menu_data() {
   local i
-  for i in {1..17}; do M_REVERSIBLE[$i]=1; done
+  for i in {1..18}; do M_REVERSIBLE[$i]=1; done
   M_REVERSIBLE[10]=0
   M_REVERSIBLE[14]=0
   M_REVERSIBLE[16]=0
@@ -3654,6 +4274,7 @@ apply_action_by_id() {
     15) act_rotate ;;
     16) bash "$SELF" --versions-only --no-menu --accept-disclaimer 2>&1 | sed -n '/1) PHP-Versionen/,/Zusammenfassung/p' ;;
     17) act_clamav ;;
+    18) act_telegram ;;
   esac
 }
 
@@ -3676,12 +4297,14 @@ revert_action_by_id() {
     15) undo_rotate ;;
     16) info "Ein lesender Scan (#16) bedarf keiner Rückabwicklung." ;;
     17) undo_clamav ;;
+    18) undo_telegram ;;
   esac
 }
 
 tui_clamav_screen() {
   clam_recommend
   clam_mode_detect
+  tg_init
   local sel=1 iscroll=0 key k2 k3
   if [ "$CLAM_MODE_WANT" = "live" ]; then sel=1
   elif [ "$CLAM_MODE_WANT" = "cron" ]; then sel=2
@@ -3692,6 +4315,9 @@ tui_clamav_screen() {
   fi
 
   local chosen="$sel"
+  local want_tg="${CLAM_TG_WANT:-$TG_CLAM}"
+  [ -z "$want_tg" ] && want_tg=1
+
   while true; do
     clam_recommend
     clam_mode_detect
@@ -3714,44 +4340,48 @@ tui_clamav_screen() {
     local common_info
 
     if [ "$UI_LANG" = "en" ]; then
-      step_title="Step 3b - ClamAV Operating Mode "
-      l_box_title="ClamAV Operating Mode"
+      step_title="Step 4b - ClamAV & Telegram Alert "
+      l_box_title="ClamAV Operating Mode & Alert"
       r_box_title="Info & RAM Recommendation"
-      intro_line=" ${CLAM_RAM_TXT}. Suggestion: ${CLAM_REC}. Choose mode with Space/Enter."
-      status_line=" Select ClamAV mode (1=Real-time clamd+On-Access, 2=Daily Cron/Timer scan, 3=Disable/None) and press [Enter]."
-      key_line=" Up/Down: select | Space/Enter: confirm mode | PgUp/PgDn: scroll Info | l: DE/EN | b/q: Back to Menu"
+      intro_line=" ${CLAM_RAM_TXT}. Suggestion: ${CLAM_REC}. Choose mode (1-3) & Telegram alert (4) with Space/Enter."
+      status_line=" Select ClamAV mode (1=Real-time, 2=Cronjob, 3=None) and toggle (4) Telegram notification with [Space], confirm with [Enter]."
+      key_line=" Up/Down: select | Space: choose/toggle | Enter: confirm | t: Telegram Bot | PgUp/Dn: Info | b/q: Back"
 
-      common_info=$(printf 'RAM ANALYSIS & RECOMMENDATION:\n%s.\n\nRECOMMENDED MODE: %s\n%s\n\nThresholds (customizable via CLAMAV_LIVE_MIN_MB=%d / CLAMAV_CRON_MIN_MB=%d):\n- Real-time (live): >= %d MB free RAM\n- Scheduled/Cron (cron): >= %d MB free RAM\nYou can switch the operating mode at any time.' \
+      common_info=$(printf 'RAM ANALYSIS & RECOMMENDATION:\n%s.\n\nRECOMMENDED MODE: %s\n%s\n\nThresholds (customizable via CLAMAV_LIVE_MIN_MB=%d / CLAMAV_CRON_MIN_MB=%d):\n- Real-time (live): >= %d MB free RAM\n- Scheduled/Cron (cron): >= %d MB free RAM\nYou can switch the operating mode and Telegram alerts at any time.' \
         "$CLAM_RAM_TXT" "$CLAM_REC" "$CLAM_REC_WHY" "$CLAMAV_LIVE_MIN_MB" "$CLAMAV_CRON_MIN_MB" "$CLAMAV_LIVE_MIN_MB" "$CLAMAV_CRON_MIN_MB")
 
       opt_title[1]="Real-time (clamd + On-Access)"
       opt_title[2]="Scheduled / Cronjob (daily 03:30)"
       opt_title[3]="No ClamAV (disable / rollback)"
+      opt_title[4]="Telegram alert on ClamAV detection"
 
       opt_info[1]=$(printf 'MODE 1: REAL-TIME MONITORING (clamd + clamonacc On-Access)\n\nWHAT DOES THIS MODE DO?\nclamd runs continuously as a background daemon and monitors /var/www, /home, /opt, /srv in real time via clamonacc (--fdpass). Detections are logged immediately to /var/log/clamav/clamonacc.log (OnAccessPrevention=no, so web traffic is never blocked).\n\nRAM REQUIREMENT:\nRequires ~1.5 GB RAM permanently (briefly more during signature reloads).\n\n%s' "$common_info")
       opt_info[2]=$(printf 'MODE 2: SCHEDULED / CRONJOB SCAN (daily at 03:30, no daemon)\n\nWHAT DOES THIS MODE DO?\nSets up /usr/local/sbin/clamav-scan.sh via systemd timer (clamav-scan.timer) or /etc/cron.d/clamav-scan at 03:30 with low CPU/IO priority (Nice=19, Idle IO, MemoryMax=2500M). Scans /var/www, /home, /root, /opt, /srv, /tmp, /var/tmp, and Docker volumes.\n\nRAM REQUIREMENT:\nZero RAM usage during normal daytime operation! The ~1.5 GB signature memory is only used during the nightly scan.\n\n%s' "$common_info")
       opt_info[3]=$(printf 'MODE 3: NO CLAMAV (DISABLE / ROLLBACK)\n\nWHAT DOES THIS MODE DO?\nIf ClamAV is currently active (real-time or cronjob), it will be stopped and disabled on [Enter] in the main menu (packages remain installed). Recommended for servers with very low available RAM.\n\n%s' "$common_info")
+      opt_info[4]=$(printf 'OPTION 4: TELEGRAM NOTIFICATION FOR CLAMAV DETECTIONS\n\nWHAT DOES THIS OPTION DO?\nDetermines whether malware/webshell detections by ClamAV are immediately sent via your Telegram Bot (/usr/local/sbin/it-reinbek-notify clamav):\n- In Real-time mode (live): Starts the systemd watcher it-reinbek-clamwatch.service on /var/log/clamav/clamonacc.log.\n- In Cronjob mode (cron): /usr/local/sbin/clamav-scan.sh sends a Telegram alert when exit code 1 (infected files found) occurs.\n\nPress [Space] on row 4 to toggle Telegram notifications for ClamAV on or off!' )
     else
-      step_title="Schritt 3b - ClamAV Betriebsart "
-      l_box_title="ClamAV Betriebsart"
+      step_title="Schritt 4b - ClamAV & Telegram "
+      l_box_title="ClamAV Betriebsart & Meldung"
       r_box_title="Info & RAM-Empfehlung"
-      intro_line=" ${CLAM_RAM_TXT}. Vorschlag: ${CLAM_REC}. Waehlen Sie mit Leertaste/Enter."
-      status_line=" ClamAV-Betriebsart waehlen (1=Echtzeit clamd+On-Access, 2=Zeitplan/Cronjob nachts, 3=Kein ClamAV) & [Enter] druecken."
-      key_line=" Pfeile: Wahl | Leertaste/Enter: Uebernehmen | Bild^/v: Info | l: DE/EN | b/q: Zurueck zum Menue"
+      intro_line=" ${CLAM_RAM_TXT}. Vorschlag: ${CLAM_REC}. Betriebsart (1-3) & Telegram (4) waehlen."
+      status_line=" Betriebsart (1=Echtzeit, 2=Cronjob, 3=Kein ClamAV) & Punkt 4 (Telegram-Meldung bei Fund) mit [Leertaste] waehlen, [Enter] uebernimmt."
+      key_line=" Pfeile: Wahl | Leertaste: Umschalten | Enter: Uebernehmen | t: Telegram-Bot | Bild^/v: Info | b/q: Zurueck"
 
-      common_info=$(printf 'RAM-ANALYSE & EMPFEHLUNG:\n%s.\n\nVORSCHLAG: %s\n%s\n\nSchwellenwerte (anpassbar per CLAMAV_LIVE_MIN_MB=%d / CLAMAV_CRON_MIN_MB=%d):\n- Echtzeit (live): ab %d MB frei\n- Zeitplan/Cronjob (cron): ab %d MB frei\nDie Empfehlung ist ein Vorschlag - Sie koennen die Betriebsart jederzeit frei waehlen oder umstellen.' \
+      common_info=$(printf 'RAM-ANALYSE & EMPFEHLUNG:\n%s.\n\nVORSCHLAG: %s\n%s\n\nSchwellenwerte (anpassbar per CLAMAV_LIVE_MIN_MB=%d / CLAMAV_CRON_MIN_MB=%d):\n- Echtzeit (live): ab %d MB frei\n- Zeitplan/Cronjob (cron): ab %d MB frei\nDie Empfehlung ist ein Vorschlag - Sie koennen die Betriebsart und die Telegram-Benachrichtigung jederzeit frei waehlen.' \
         "$CLAM_RAM_TXT" "$CLAM_REC" "$CLAM_REC_WHY" "$CLAMAV_LIVE_MIN_MB" "$CLAMAV_CRON_MIN_MB" "$CLAMAV_LIVE_MIN_MB" "$CLAMAV_CRON_MIN_MB")
 
       opt_title[1]="Echtzeit (clamd + On-Access)"
       opt_title[2]="Zeitplan / Cronjob (taegl. 03:30)"
       opt_title[3]="Kein ClamAV (Deaktivieren)"
+      opt_title[4]="Telegram-Meldung bei ClamAV-Fund"
 
       opt_info[1]=$(printf 'MODUS 1: ECHTZEIT-UEBERWACHUNG (clamd + clamonacc On-Access)\n\nWAS MACHT DIESE BETRIEBSART?\nclamd laeuft dauerhaft als Dienst und ueberwacht /var/www, /home, /opt, /srv in Echtzeit per clamonacc (--fdpass). Neue Webshells oder Backdoors werden sofort beim Anlegen erkannt und in /var/log/clamav/clamonacc.log gemeldet (OnAccessPrevention=no, blockiert den Webbetrieb nicht).\n\nSPEICHERBEDARF (RAM):\nBenoetigt dauerhaft ca. 1,5 GB RAM (beim Signatur-Reload kurzzeitig mehr).\n\n%s' "$common_info")
       opt_info[2]=$(printf 'MODUS 2: ZEITPLAN / CRONJOB (taeglicher Scan um 03:30, ohne Daemon)\n\nWAS MACHT DIESE BETRIEBSART?\nRichtet /usr/local/sbin/clamav-scan.sh per systemd-Timer (clamav-scan.timer) bzw. /etc/cron.d/clamav-scan um 03:30 Uhr mit niedriger Prioritaet (Nice=19, Idle-IO, MemoryMax=2500M) ein. Prueft /var/www, /home, /root, /opt, /srv, /tmp, /var/tmp sowie Docker-Volumes (ohne DB-Volumes).\n\nSPEICHERBEDARF (RAM):\nTagsueber 0 MB Dauer-RAM! Die ca. 1,5 GB RAM werden nur nachts waehrend des Scans belegt.\n\n%s' "$common_info")
       opt_info[3]=$(printf 'MODUS 3: KEIN CLAMAV (DEAKTIVIEREN / RUECKBAU)\n\nWAS MACHT DIESE BETRIEBSART?\nIst ClamAV bereits eingerichtet (Echtzeit oder Cronjob), werden Dienste und Timer beim Anwenden im Hauptmenue gestoppt und deaktiviert (Pakete bleiben installiert). Sinnvoll bei sehr wenig freiem Arbeitsspeicher.\n\n%s' "$common_info")
+      opt_info[4]=$(printf 'OPTION 4: TELEGRAM-BENACHRICHTIGUNG BEI CLAMAV-FUND\n\nWAS MACHT DIESE OPTION?\nLegt fest, ob Viren- und Webshell-Funde von ClamAV sofort ueber den zentralen Telegram-Bot (/usr/local/sbin/it-reinbek-notify clamav) gemeldet werden:\n- Im Echtzeit-Modus (live): Ueberwacht /var/log/clamav/clamonacc.log per Dienst it-reinbek-clamwatch.service.\n- Im Cronjob-Modus (cron): /usr/local/sbin/clamav-scan.sh sendet bei Exit-Code 1 (Fund) sofort die Trefferliste per Telegram.\n\nMit [Leertaste] auf Zeile 4 schalten Sie die Telegram-Benachrichtigung fuer ClamAV ein oder aus! Falls noch kein Bot-Token hinterlegt ist, oeffnet sich automatisch der Telegram-Dialog.' )
     fi
 
-    local b1="" b2="" b3=""
+    local b1="" b2="" b3="" b4=""
     if [ "$UI_LANG" = "en" ]; then
       [ "$CLAM_REC" = "live" ] && b1="recommended"
       [ "$CLAM_REC" = "cron" ] && b2="recommended"
@@ -3759,6 +4389,7 @@ tui_clamav_screen() {
       [ "$CLAM_MODE_CUR" = "live" ] && b1="active${b1:+, $b1}"
       [ "$CLAM_MODE_CUR" = "cron" ] && b2="active${b2:+, $b2}"
       [ "$CLAM_MODE_CUR" = "none" ] && b3="inactive${b3:+, $b3}"
+      [ "$want_tg" -eq 1 ] && b4="YES (active)" || b4="NO (off)"
     else
       [ "$CLAM_REC" = "live" ] && b1="empfohlen"
       [ "$CLAM_REC" = "cron" ] && b2="empfohlen"
@@ -3766,10 +4397,286 @@ tui_clamav_screen() {
       [ "$CLAM_MODE_CUR" = "live" ] && b1="aktiv${b1:+, $b1}"
       [ "$CLAM_MODE_CUR" = "cron" ] && b2="aktiv${b2:+, $b2}"
       [ "$CLAM_MODE_CUR" = "none" ] && b3="inaktiv${b3:+, $b3}"
+      [ "$want_tg" -eq 1 ] && b4="JA (aktiv)" || b4="NEIN (aus)"
     fi
     opt_badge[1]="${b1:+[$b1]}"
     opt_badge[2]="${b2:+[$b2]}"
     opt_badge[3]="${b3:+[$b3]}"
+    opt_badge[4]="[$b4]"
+
+    local -a rlines=()
+    local rline wline
+    while IFS= read -r rline; do
+      if [ -z "$rline" ]; then
+        rlines+=("")
+      else
+        while IFS= read -r wline; do
+          rlines+=("$wline")
+        done < <(printf '%s\n' "$rline" | fold -s -w "$r_inner")
+      fi
+    done <<< "${opt_info[$sel]}"
+
+    local r_total="${#rlines[@]}"
+    local rmax=$(( r_total - box_h ))
+    [ "$rmax" -lt 0 ] && rmax=0
+    [ "$iscroll" -gt "$rmax" ] && iscroll="$rmax"
+    [ "$iscroll" -lt 0 ] && iscroll=0
+    local r_more_up=0 r_more_dn=0
+    [ "$iscroll" -gt 0 ] && r_more_up=1
+    [ $(( iscroll + box_h )) -lt "$r_total" ] && r_more_dn=1
+
+    local rup_s="" rdn_s=""
+    if [ "$r_more_up" -eq 1 ]; then rup_s=$( [ "$UI_LANG" = "en" ] && echo " ^more " || echo " ^mehr " ); fi
+    if [ "$r_more_dn" -eq 1 ]; then rdn_s=$( [ "$UI_LANG" = "en" ] && echo " PgDn v more " || echo " Bild v mehr " ); fi
+
+    local l_fill_top=$(( lw - ${#l_box_title} - 4 ))
+    [ "$l_fill_top" -lt 1 ] && l_fill_top=1
+    local r_fill_top=$(( rw - ${#r_box_title} - ${#rup_s} - 4 ))
+    [ "$r_fill_top" -lt 1 ] && r_fill_top=1
+
+    printf '\e[H\e[2J'
+    tui_topbar "$cols" " IT-Reinbek PHP2Shell-Auditor v${VERSION}" "$step_title"
+    printf '%s\n' "${intro_line:0:$cols}"
+    printf '%s+-- %s%s%s %s++-- %s%s%s %s%s%s%s+%s\n' \
+      "$C" "$C$B" "$l_box_title" "$N$C" "$(printf '%*s' "$l_fill_top" '' | tr ' ' '-')" \
+      "$C$B" "$r_box_title" "$N$C" "$(printf '%*s' "$r_fill_top" '' | tr ' ' '-')" "$Y" "$rup_s" "$C" "$N"
+
+    local row idx mark item_color badge title max_tlen lstr raw_len pad_len lpad rstr r_pad rfmt
+    for (( row=0; row<box_h; row++ )); do
+      idx=$(( row + 1 ))
+      rstr="${rlines[$(( iscroll + row ))]:-}"
+      if [ "$idx" -le 4 ]; then
+        item_color=""
+        mark=" "
+        if [ "$idx" -le 3 ]; then
+          if [ "$idx" -eq "$chosen" ]; then
+            if { [ "$idx" -eq 1 ] && [ "$CLAM_MODE_CUR" = "live" ]; } || { [ "$idx" -eq 2 ] && [ "$CLAM_MODE_CUR" = "cron" ]; }; then
+              mark="x"; item_color="$G"
+            elif [ "$idx" -eq 3 ] && [ "$CLAM_MODE_CUR" != "none" ]; then
+              mark="-"; item_color="${R}${B}"
+            else
+              mark="+"; item_color="${Y}${B}"
+            fi
+          fi
+        else
+          if [ "$want_tg" -eq 1 ]; then
+            if [ "$TG_CUR" -eq 1 ] && [ "$(tg_conf_get TG_CLAMAV)" = "1" ]; then
+              mark="x"; item_color="$G"
+            else
+              mark="+"; item_color="${Y}${B}"
+            fi
+          else
+            if [ "$TG_CUR" -eq 1 ] && [ "$(tg_conf_get TG_CLAMAV)" = "1" ]; then
+              mark="-"; item_color="${R}${B}"
+            else
+              mark=" "; item_color=""
+            fi
+          fi
+        fi
+        badge="${opt_badge[$idx]}"
+        title="${opt_title[$idx]}"
+        max_tlen=$(( lw - 12 - ${#badge} ))
+        [ "$max_tlen" -lt 10 ] && max_tlen=10
+        title="${title:0:$max_tlen}"
+        if [ "$idx" -eq "$sel" ]; then
+          lstr=" > [$mark] $idx) $title"
+        else
+          lstr="   [$mark] $idx) $title"
+        fi
+        raw_len=$(( ${#lstr} + ${#badge} + 1 ))
+        pad_len=$(( lw - raw_len ))
+        [ "$pad_len" -lt 1 ] && pad_len=1
+        lstr="${lstr}$(printf '%*s' "$pad_len" '')${badge} "
+        if [ "$idx" -eq "$sel" ]; then
+          if [ -n "$item_color" ]; then
+            lpad=$'\e[7m'"${item_color}${B}${lstr}"$'\e[0m'
+          else
+            lpad=$'\e[7m'"${B}${lstr}"$'\e[0m'
+          fi
+        elif [ -n "$item_color" ]; then
+          lpad="${item_color}${lstr}${N}"
+        else
+          lpad="${lstr}"
+        fi
+      else
+        lpad=$(printf '%*s' "$lw" '')
+      fi
+
+      rstr="${rstr:0:$r_inner}"
+      r_pad=$(( r_inner - ${#rstr} ))
+      [ "$r_pad" -lt 0 ] && r_pad=0
+      case "$rstr" in
+        MODUS*|MODE\ *|OPTION\ *)
+          rfmt=" ${B}${rstr}${N}$(printf '%*s' "$r_pad" '') " ;;
+        WAS\ MACHT*|SPEICHERBEDARF*|RAM-ANALYSE*|WHAT\ DOES*|RAM\ REQUIREMENT*|RAM\ ANALYSIS*)
+          rfmt=" ${B}${C}${rstr}${N}$(printf '%*s' "$r_pad" '') " ;;
+        VORSCHLAG:*|RECOMMENDED\ MODE:*)
+          rfmt=" ${G}${B}${rstr}${N}$(printf '%*s' "$r_pad" '') " ;;
+        *)
+          rfmt=" ${rstr}$(printf '%*s' "$r_pad" '') " ;;
+      esac
+      printf '%s|%s%s%s||%s%s%s|%s\n' "$C" "$N" "$lpad" "$C" "$N" "$rfmt" "$C" "$N"
+    done
+
+    local r_fill_bot=$(( rw - ${#rdn_s} ))
+    [ "$r_fill_bot" -lt 1 ] && r_fill_bot=1
+    printf '%s+%s++%s%s%s%s+%s\n' \
+      "$C" "$(printf '%*s' "$lw" '' | tr ' ' '-')" \
+      "$(printf '%*s' "$r_fill_bot" '' | tr ' ' '-')" "$Y" "$rdn_s" "$C" "$N"
+    printf '%s%s%s\n' "$C" "${status_line:0:$cols}" "$N"
+    printf '%s%s%s' "$B" "${key_line:0:$cols}" "$N"
+
+    IFS= tty_read -rsn1 key || return 0
+    if [[ "$key" == $'\e' ]]; then
+      IFS= tty_read -rsn1 -t 0.05 k2 || k2=""
+      if [[ "$k2" == "[" ]]; then
+        IFS= tty_read -rsn1 -t 0.05 k3 || k3=""
+        case "$k3" in
+          A) sel=$(( sel > 1 ? sel - 1 : 4 )); [ "$sel" -le 3 ] && chosen="$sel"; iscroll=0 ;;
+          B) sel=$(( sel < 4 ? sel + 1 : 1 )); [ "$sel" -le 3 ] && chosen="$sel"; iscroll=0 ;;
+          5) IFS= tty_read -rsn1 -t 0.02 _ || true; iscroll=$(( iscroll > 5 ? iscroll - 5 : 0 )) ;;
+          6) IFS= tty_read -rsn1 -t 0.02 _ || true; iscroll=$(( iscroll + 5 )) ;;
+        esac
+      fi
+      continue
+    fi
+
+    case "$key" in
+      k|K) sel=$(( sel > 1 ? sel - 1 : 4 )); [ "$sel" -le 3 ] && chosen="$sel"; iscroll=0 ;;
+      j|J) sel=$(( sel < 4 ? sel + 1 : 1 )); [ "$sel" -le 3 ] && chosen="$sel"; iscroll=0 ;;
+      1|2|3) sel="$key"; chosen="$key"; iscroll=0 ;;
+      4) sel=4; want_tg=$(( 1 - want_tg )); iscroll=0 ;;
+      " ")
+        if [ "$sel" -eq 4 ]; then
+          want_tg=$(( 1 - want_tg ))
+        else
+          chosen="$sel"
+        fi
+        ;;
+      t|T)
+        tui_telegram_screen "sub"
+        ;;
+      l|L)
+        if [ "$UI_LANG" = "de" ]; then UI_LANG="en"; else UI_LANG="de"; fi
+        ;;
+      b|B|q|Q)
+        load_menu_texts
+        return 0
+        ;;
+      "")
+        [ "$sel" -le 3 ] && chosen="$sel"
+        CLAM_TG_WANT="$want_tg"
+        TG_CLAM="$want_tg"
+        case "$chosen" in
+          1)
+            CLAM_MODE_WANT="live"
+            M_SEL[17]=1
+            if [ "$CLAM_MODE_CUR" != "live" ]; then M_ACTIVE[17]=0; fi
+            ;;
+          2)
+            CLAM_MODE_WANT="cron"
+            M_SEL[17]=1
+            if [ "$CLAM_MODE_CUR" != "cron" ]; then M_ACTIVE[17]=0; fi
+            ;;
+          3)
+            CLAM_MODE_WANT="none"
+            M_SEL[17]=0
+            ;;
+        esac
+        if [ "$chosen" != "3" ] && [ "$want_tg" -eq 1 ] && ! tg_is_configured && [ -z "$TG_TOKEN_IN" ]; then
+          TG_ON=1
+          M_SEL[18]=1
+          tui_telegram_screen "sub"
+        fi
+        load_menu_texts
+        return 0
+        ;;
+    esac
+  done
+}
+
+tui_auditd_screen() {
+  tg_init
+  local aud_cur=0 watch_cur=0 sel=1 chosen=1 iscroll=0 key k2 k3
+  [ -f "$AUDIT_RULE" ] && aud_cur=1
+  systemctl is-active --quiet it-reinbek-auditwatch.service 2>/dev/null && watch_cur=1
+
+  if [ "${AUDIT_TG_WANT:-}" = "1" ]; then
+    sel=1
+  elif [ "${AUDIT_TG_WANT:-}" = "0" ]; then
+    sel=2
+  elif [ "$aud_cur" -eq 1 ] && [ "$watch_cur" -eq 1 ]; then
+    sel=1
+  elif [ "$aud_cur" -eq 1 ] && [ "$watch_cur" -eq 0 ]; then
+    if [ "${TG_AUDIT:-1}" -eq 1 ] && { [ "$TG_ON" -eq 1 ] || [ "$TG_CUR" -eq 1 ]; }; then sel=1; else sel=2; fi
+  else
+    sel=1
+  fi
+  chosen="$sel"
+
+  while true; do
+    aud_cur=0; watch_cur=0
+    [ -f "$AUDIT_RULE" ] && aud_cur=1
+    systemctl is-active --quiet it-reinbek-auditwatch.service 2>/dev/null && watch_cur=1
+
+    local cols rows lw rw box_h r_inner
+    cols=$(tput cols 2>/dev/null || echo 118)
+    rows=$(tput lines 2>/dev/null || echo 34)
+    [ "$cols" -lt 96 ] && cols=96
+    [ "$rows" -lt 24 ] && rows=24
+    lw=$(( cols * 46 / 100 ))
+    [ "$lw" -lt 44 ] && lw=44
+    [ "$lw" -gt 62 ] && lw=62
+    rw=$(( cols - lw - 4 ))
+    [ "$rw" -lt 36 ] && rw=36
+    box_h=$(( rows - 6 ))
+    [ "$box_h" -lt 16 ] && box_h=16
+    r_inner=$(( rw - 2 ))
+
+    local step_title l_box_title r_box_title intro_line status_line key_line
+    local -a opt_title=() opt_badge=() opt_info=()
+
+    if [ "$UI_LANG" = "en" ]; then
+      step_title="Step 4a - auditd & Telegram Notification "
+      l_box_title="auditd & Notification Mode"
+      r_box_title="Info & Security Notes"
+      intro_line=" Choose whether auditd (php2shell_exec) should send Telegram alerts (even if auditd is already enabled)."
+      status_line=" Select mode (1=auditd + Telegram alert, 2=auditd local log only, 3=Disable/Rollback auditd) and press [Enter]."
+      key_line=" Up/Down: select | Space/Enter: confirm | t: Configure Telegram Bot | l: DE/EN | b/q: Back"
+
+      opt_title[1]="auditd + Telegram alert (recommended)"
+      opt_title[2]="auditd local only (/var/log/audit)"
+      opt_title[3]="Disable auditd rule (rollback)"
+
+      opt_info[1]=$'OPTION 1: AUDITD + TELEGRAM NOTIFICATION (it-reinbek-auditwatch)\n\nWHAT DOES THIS OPTION DO?\n1. Ensures /etc/audit/rules.d/99-php2shell.rules is active (logs all execve 64/32-bit process executions by www-data/apache/nginx under key php2shell_exec).\n2. Installs and starts the systemd service it-reinbek-auditwatch.service, which watches /var/log/audit/audit.log in real time and sends immediate Telegram alerts via /usr/local/sbin/it-reinbek-notify auditd whenever a web worker spawns a shell or binary.\n\nIf Telegram credentials are not yet configured, selecting this option automatically opens the Telegram Bot setup screen.'
+      opt_info[2]=$'OPTION 2: AUDITD LOCAL LOGGING ONLY (NO TELEGRAM)\n\nWHAT DOES THIS OPTION DO?\nKeeps or enables /etc/audit/rules.d/99-php2shell.rules for local forensic logging in /var/log/audit/audit.log (inspect with: ausearch -k php2shell_exec), but disables/stops the Telegram watcher (it-reinbek-auditwatch.service).'
+      opt_info[3]=$'OPTION 3: DISABLE AUDITD RULE (ROLLBACK)\n\nWHAT DOES THIS OPTION DO?\nMarks #13 for rollback [-]: Stops it-reinbek-auditwatch.service, removes /etc/audit/rules.d/99-php2shell.rules, and unloads the php2shell_exec kernel rule on [Enter] in the main menu.'
+    else
+      step_title="Schritt 4a - auditd & Telegram-Meldung "
+      l_box_title="auditd & Benachrichtigung"
+      r_box_title="Info & Funktionsweise"
+      intro_line=" Waehlen Sie, ob bei auditd (php2shell_exec) eine Telegram-Benachrichtigung gewuenscht ist (auch bei bereits aktivem auditd)."
+      status_line=" Option waehlen (1=auditd + Telegram-Meldung, 2=auditd nur lokal ohne Telegram, 3=auditd deaktivieren) & [Enter] druecken."
+      key_line=" Pfeile: Wahl | Leertaste/Enter: Uebernehmen | t: Telegram-Bot konfigurieren | l: DE/EN | b/q: Zurueck"
+
+      opt_title[1]="auditd + Telegram-Meldung (empf.)"
+      opt_title[2]="auditd nur lokal (ohne Telegram)"
+      opt_title[3]="auditd deaktivieren (Rueckbau)"
+
+      opt_info[1]=$'OPTION 1: AUDITD + TELEGRAM-BENACHRICHTIGUNG (it-reinbek-auditwatch)\n\nWAS MACHT DIESE OPTION?\n1. Stellt sicher, dass die Kernel-Regel /etc/audit/rules.d/99-php2shell.rules aktiv ist (protokolliert alle Programm-/Shell-Starts execve 64/32-Bit durch Webserver-Benutzer unter dem Schluessel php2shell_exec).\n2. Richtet den Hintergrunddienst it-reinbek-auditwatch.service ein, der /var/log/audit/audit.log in Echtzeit ueberwacht und verdächtige Prozessstarts sofort ueber /usr/local/sbin/it-reinbek-notify auditd an Ihren Telegram-Bot meldet.\n\nAuch wenn auditd bereits vorher eingerichtet war, koennen Sie die Telegram-Meldung hier jederzeit nachtraeglich zu- oder abschalten! Falls noch kein Bot-Token hinterlegt ist, oeffnet sich automatisch der Telegram-Dialog.'
+      opt_info[2]=$'OPTION 2: AUDITD NUR LOKAL PROTOKOLLIEREN (OHNE TELEGRAM)\n\nWAS MACHT DIESE OPTION?\nAktiviert bzw. behaelt /etc/audit/rules.d/99-php2shell.rules fuer die lokale Auswertung in /var/log/audit/audit.log (Abfrage mit: ausearch -k php2shell_exec), schaltet aber den Telegram-Watcher (it-reinbek-auditwatch.service) ab.'
+      opt_info[3]=$'OPTION 3: AUDITD-UEBERWACHUNG DEAKTIVIEREN (RUECKBAU)\n\nWAS MACHT DIESE OPTION?\nMarkiert Massnahme #13 zur Rueckabwicklung [-]: Stoppt it-reinbek-auditwatch.service, loescht /etc/audit/rules.d/99-php2shell.rules und entlaedt die Regel im Kernel beim Ausfuehren im Hauptmenue.'
+    fi
+
+    if [ "$UI_LANG" = "en" ]; then
+      if [ "$aud_cur" -eq 1 ] && [ "$watch_cur" -eq 1 ]; then opt_badge[1]="[active]"; else opt_badge[1]="[recommended]"; fi
+      if [ "$aud_cur" -eq 1 ] && [ "$watch_cur" -eq 0 ]; then opt_badge[2]="[active]"; else opt_badge[2]="[local]"; fi
+      if [ "$aud_cur" -eq 0 ]; then opt_badge[3]="[inactive]"; else opt_badge[3]="[rollback]"; fi
+    else
+      if [ "$aud_cur" -eq 1 ] && [ "$watch_cur" -eq 1 ]; then opt_badge[1]="[aktiv]"; else opt_badge[1]="[empfohlen]"; fi
+      if [ "$aud_cur" -eq 1 ] && [ "$watch_cur" -eq 0 ]; then opt_badge[2]="[aktiv]"; else opt_badge[2]="[nur lokal]"; fi
+      if [ "$aud_cur" -eq 0 ]; then opt_badge[3]="[inaktiv]"; else opt_badge[3]="[rueckbau]"; fi
+    fi
 
     local -a rlines=()
     local rline wline
@@ -3816,9 +4723,9 @@ tui_clamav_screen() {
         item_color=""
         mark=" "
         if [ "$idx" -eq "$chosen" ]; then
-          if { [ "$idx" -eq 1 ] && [ "$CLAM_MODE_CUR" = "live" ]; } || { [ "$idx" -eq 2 ] && [ "$CLAM_MODE_CUR" = "cron" ]; }; then
+          if { [ "$idx" -eq 1 ] && [ "$aud_cur" -eq 1 ] && [ "$watch_cur" -eq 1 ]; } || { [ "$idx" -eq 2 ] && [ "$aud_cur" -eq 1 ] && [ "$watch_cur" -eq 0 ]; }; then
             mark="x"; item_color="$G"
-          elif [ "$idx" -eq 3 ] && [ "$CLAM_MODE_CUR" != "none" ]; then
+          elif [ "$idx" -eq 3 ] && [ "$aud_cur" -eq 1 ]; then
             mark="-"; item_color="${R}${B}"
           else
             mark="+"; item_color="${Y}${B}"
@@ -3857,12 +4764,10 @@ tui_clamav_screen() {
       r_pad=$(( r_inner - ${#rstr} ))
       [ "$r_pad" -lt 0 ] && r_pad=0
       case "$rstr" in
-        MODUS*|MODE\ *)
+        OPTION\ *)
           rfmt=" ${B}${rstr}${N}$(printf '%*s' "$r_pad" '') " ;;
-        WAS\ MACHT*|SPEICHERBEDARF*|RAM-ANALYSE*|WHAT\ DOES*|RAM\ REQUIREMENT*|RAM\ ANALYSIS*)
+        WAS\ MACHT*|WHAT\ DOES*)
           rfmt=" ${B}${C}${rstr}${N}$(printf '%*s' "$r_pad" '') " ;;
-        VORSCHLAG:*|RECOMMENDED\ MODE:*)
-          rfmt=" ${G}${B}${rstr}${N}$(printf '%*s' "$r_pad" '') " ;;
         *)
           rfmt=" ${rstr}$(printf '%*s' "$r_pad" '') " ;;
       esac
@@ -3897,6 +4802,9 @@ tui_clamav_screen() {
       j|J) sel=$(( sel < 3 ? sel + 1 : 1 )); chosen="$sel"; iscroll=0 ;;
       1|2|3) sel="$key"; chosen="$key"; iscroll=0 ;;
       " ") chosen="$sel" ;;
+      t|T)
+        tui_telegram_screen "sub"
+        ;;
       l|L)
         if [ "$UI_LANG" = "de" ]; then UI_LANG="en"; else UI_LANG="de"; fi
         ;;
@@ -3908,20 +4816,444 @@ tui_clamav_screen() {
         chosen="$sel"
         case "$chosen" in
           1)
-            CLAM_MODE_WANT="live"
-            M_SEL[17]=1
-            if [ "$CLAM_MODE_CUR" = "cron" ]; then M_ACTIVE[17]=0; fi
+            AUDIT_TG_WANT="1"
+            TG_AUDIT=1
+            M_SEL[13]=1
+            # Falls auditd schon aktiv war, aber der Telegram-Watcher noch nicht läuft -> als [+] Änderung vormerken!
+            if [ "$aud_cur" -eq 1 ] && [ "$watch_cur" -eq 0 ]; then
+              M_ACTIVE[13]=0
+            fi
+            if ! tg_is_configured && [ -z "$TG_TOKEN_IN" ]; then
+              TG_ON=1
+              M_SEL[18]=1
+              tui_telegram_screen "sub"
+            fi
             ;;
           2)
-            CLAM_MODE_WANT="cron"
-            M_SEL[17]=1
-            if [ "$CLAM_MODE_CUR" = "live" ]; then M_ACTIVE[17]=0; fi
+            AUDIT_TG_WANT="0"
+            TG_AUDIT=0
+            M_SEL[13]=1
+            # Falls auditd aktiv war und der Watcher lief, jetzt auf "nur lokal" umstellen -> als [+] Änderung vormerken
+            if [ "$aud_cur" -eq 1 ] && [ "$watch_cur" -eq 1 ]; then
+              M_ACTIVE[13]=0
+            fi
             ;;
           3)
-            CLAM_MODE_WANT="none"
-            M_SEL[17]=0
+            AUDIT_TG_WANT="0"
+            M_SEL[13]=0
             ;;
         esac
+        load_menu_texts
+        return 0
+        ;;
+    esac
+  done
+}
+
+tui_telegram_screen() {
+  local mode="${1:-wizard}"
+  tg_init
+  local sel=1 iscroll=0 key k2 k3 val="" status_msg=""
+
+  while true; do
+    local cols rows lw rw box_h r_inner
+    cols=$(tput cols 2>/dev/null || echo 118)
+    rows=$(tput lines 2>/dev/null || echo 34)
+    [ "$cols" -lt 96 ] && cols=96
+    [ "$rows" -lt 24 ] && rows=24
+    lw=$(( cols * 48 / 100 ))
+    [ "$lw" -lt 46 ] && lw=46
+    [ "$lw" -gt 64 ] && lw=64
+    rw=$(( cols - lw - 4 ))
+    [ "$rw" -lt 36 ] && rw=36
+    box_h=$(( rows - 6 ))
+    [ "$box_h" -lt 16 ] && box_h=16
+    r_inner=$(( rw - 2 ))
+
+    local tok_disp="(nicht gesetzt)"
+    if [ -n "$TG_TOKEN_IN" ]; then
+      tok_disp="${TG_TOKEN_IN:0:9}... (Laenge ${#TG_TOKEN_IN})"
+    fi
+    local chat_disp="${TG_CHAT_IN:-(nicht gesetzt)}"
+    local lbl_disp="${TG_LABEL_IN:-$(hostname -f 2>/dev/null || hostname)}"
+
+    local step_title l_box_title r_box_title intro_line status_line key_line
+    local -a opt_title=() opt_badge=() opt_info=()
+    local sec_info
+
+    if [ "$UI_LANG" = "en" ]; then
+      step_title="Step 3/4 - Telegram Bot & Notifications "
+      l_box_title="Telegram Bot & Components"
+      r_box_title="Info & Security"
+      intro_line=" Should security alerts be sent via Telegram Bot? Credentials are stored securely (0600 root:root) for all modules."
+      if [ -n "$status_msg" ]; then
+        status_line=" $status_msg"
+      else
+        status_line=" Space: toggle [x]/[ ] or edit field (2-4) | t: Test token/chat (read-only) | Enter: Save & Continue"
+      fi
+      key_line=" Up/Down: select | Space: Toggle/Edit | t: Test Bot/Chat | Enter: Continue | l: DE/EN | q: Back/Skip"
+
+      sec_info=$(printf 'SECURE STORAGE & ARCHITECTURE:\n- Directory /etc/it-reinbek is locked to mode 0700 (root:root).\n- Config /etc/it-reinbek/telegram.conf is written atomically via mktemp with mode 0600 (root:root).\n- Dispatcher /usr/local/sbin/it-reinbek-notify (mode 0750 root:root) passes the Bot Token to curl via stdin (-K -), so the token never appears in process lists (ps / /proc/*/cmdline).\n- Rate-limiting (max 20 msgs / 5 min) protects against alert storms.\n- Shared 1:1 with the IT-Reinbek Linux Hardening script (fail2ban, rkhunter, ClamAV, auditd).')
+
+      opt_title[1]="Enable Telegram Bot notifications"
+      opt_title[2]="Bot Token: $tok_disp"
+      opt_title[3]="Chat-ID:   $chat_disp"
+      opt_title[4]="Server:    $lbl_disp"
+      opt_title[5]="fail2ban:  Report IP bans (stored/active)"
+      opt_title[6]="rkhunter:  Report rootkit warnings (stored)"
+      opt_title[7]="ClamAV:    Report malware/webshell hits"
+      opt_title[8]="auditd:    Report PHP shell/execve starts"
+      opt_title[9]="Test Token & Chat-ID now (read-only)"
+
+      opt_info[1]=$(printf '1) TELEGRAM BOT NOTIFICATIONS (MASTER SWITCH)\n\nQuestion before remediation:\nShould this server send security notifications via a Telegram Bot?\n\n- [x] / [+] Enabled: Collects Bot Token, Chat-ID, and Server Label and stores them securely for fail2ban, rkhunter, ClamAV, and auditd.\n- [ ] Disabled: No Telegram messages will be sent.\n\n%s' "$sec_info")
+      opt_info[2]=$(printf '2) TELEGRAM BOT TOKEN (Press [Space] to enter/change)\n\nCurrent value: %s\n\nHow to create a bot:\n1. Open Telegram and message @BotFather -> /newbot\n2. Copy the HTTP API Token (format: 123456789:AAH...)\n3. Send at least one message (/start) to your new bot in Telegram!\n\n%s' "$tok_disp" "$sec_info")
+      opt_info[3]=$(printf '3) TELEGRAM CHAT-ID (Press [Space] to enter/change)\n\nCurrent value: %s\n\nFormats:\n- Personal chat: positive number (e.g. 123456789, get via @userinfobot)\n- Group / Channel: negative number (e.g. -1001234567890)\n\n%s' "$chat_disp" "$sec_info")
+      opt_info[4]=$(printf '4) SERVER LABEL (Press [Space] to enter/change)\n\nCurrent value: %s\n\nShown in the header of every Telegram message so you immediately recognize which host sent the alert.\n\n%s' "$lbl_disp" "$sec_info")
+      opt_info[5]=$(printf '5) MODULE: FAIL2BAN (TG_FAIL2BAN)\n\nStores TG_FAIL2BAN=1 in /etc/it-reinbek/telegram.conf and (if fail2ban is installed) hooks /etc/fail2ban/action.d/it-reinbek-telegram.conf into jail.local so IP bans are reported immediately.\n\n%s' "$sec_info")
+      opt_info[6]=$(printf '6) MODULE: RKHUNTER (TG_RKHUNTER)\n\nStores TG_RKHUNTER=1 in /etc/it-reinbek/telegram.conf and installs /etc/cron.daily/rkhunter-it-reinbek so daily Rootkit Hunter warnings are sent via Telegram.\n\n%s' "$sec_info")
+      opt_info[7]=$(printf '7) MODULE: CLAMAV (TG_CLAMAV)\n\nReports malware & webshell findings from ClamAV (both in Real-time mode via it-reinbek-clamwatch.service and in daily Cron/Timer mode via clamav-scan.sh).\n\n%s' "$sec_info")
+      opt_info[8]=$(printf '8) MODULE: AUDITD (TG_AUDITD - php2shell_exec)\n\nReports suspicious program/shell executions by webserver users (www-data, apache, nginx) in real time via it-reinbek-auditwatch.service - works even if auditd was already configured previously!\n\n%s' "$sec_info")
+      opt_info[9]=$(printf '9) READ-ONLY API TEST (getMe & getChat)\n\nPress [Space] or [t] to verify your Bot Token and Chat-ID against api.telegram.org without modifying the system yet.\n\n%s' "$sec_info")
+    else
+      step_title="Schritt 3/4 - Telegram-Bot & Bausteine "
+      l_box_title="Telegram-Bot & Bausteine"
+      r_box_title="Info & Sicherheit"
+      intro_line=" Sollen Infos via Telegram-Bot gesendet werden? Zugangsdaten werden fuer alle Bausteine sicher abgelegt (0600 root:root)."
+      if [ -n "$status_msg" ]; then
+        status_line=" $status_msg"
+      else
+        status_line=" Leertaste: [x]/[ ] umschalten od. Feld (2-4) eingeben | t: Token/Chat pruefen | Enter: Uebernehmen & Weiter"
+      fi
+      key_line=" Pfeile: Wahl | Leertaste: Umschalten/Eingabe | t: Bot-Test | Enter: Weiter (Menue) | l: DE/EN | q: Zurueck"
+
+      sec_info=$(printf 'SICHERE ABLAGE GEGEN UNERLAUBTEN ZUGRIFF:\n- Ordner /etc/it-reinbek wird mit 0700 (root:root) angelegt.\n- Konfig /etc/it-reinbek/telegram.conf wird atomar per mktemp mit 0600 (root:root) geschrieben.\n- Dispatcher /usr/local/sbin/it-reinbek-notify (0750 root:root) uebergibt das Bot-Token per Stdin (curl -K -), sodass es niemals in der Prozessliste (ps / /proc/*/cmdline) sichtbar ist.\n- Rate-Limit (max. 20 Nachr./5 Min.) schuetzt vor Nachrichtenflut.\n- Kompatibel & vorgehalten fuer das IT-Reinbek Linux-Haertungsskript (fail2ban, rkhunter, ClamAV, auditd).')
+
+      opt_title[1]="Telegram-Benachrichtigungen nutzen"
+      opt_title[2]="Bot-Token: $tok_disp"
+      opt_title[3]="Chat-ID:   $chat_disp"
+      opt_title[4]="Server:    $lbl_disp"
+      opt_title[5]="fail2ban:  IP-Sperren melden (vorhalten)"
+      opt_title[6]="rkhunter:  Warnungen melden (vorhalten)"
+      opt_title[7]="ClamAV:    Viren-/Webshell-Funde melden"
+      opt_title[8]="auditd:    Shell-/Prozessstarts melden"
+      opt_title[9]="Verbindung testen (getMe / getChat)"
+
+      opt_info[1]=$(printf '1) TELEGRAM-BOT BENACHRICHTIGUNGEN (HAUPTSCHALTER)\n\nVorab-Abfrage:\nSollen Sicherheits-Informationen via Telegram-Bot gesendet werden?\n\n- [x] / [+] Aktiviert: Fragt Bot-Token, Chat-ID und Server-Label ab und legt diese gegen unerlaubten Zugriff geschuetzt fuer fail2ban, rkhunter, ClamAV und auditd ab.\n- [ ] Deaktiviert: Es werden keine Nachrichten per Telegram versendet.\n\n%s' "$sec_info")
+      opt_info[2]=$(printf '2) TELEGRAM BOT-TOKEN (Mit [Leertaste] eingeben/aendern)\n\nAktuell: %s\n\nSo erstellen Sie den Bot:\n1. In Telegram @BotFather oeffnen -> /newbot senden\n2. Den HTTP-API-Token kopieren (Format: 123456789:AAH...)\n3. Dem neuen Bot in Telegram einmal /start schreiben!\n(Eingabe erfolgt verdeckt ohne Echo auf dem Bildschirm)\n\n%s' "$tok_disp" "$sec_info")
+      opt_info[3]=$(printf '3) TELEGRAM CHAT-ID (Mit [Leertaste] eingeben/aendern)\n\nAktuell: %s\n\nFormate:\n- Einzelchat: positive Zahl (z. B. 123456789, abrufbar ueber @userinfobot)\n- Gruppe / Kanal: negative Zahl (z. B. -1001234567890)\n\n%s' "$chat_disp" "$sec_info")
+      opt_info[4]=$(printf '4) SERVER-NAME / LABEL (Mit [Leertaste] eingeben/aendern)\n\nAktuell: %s\n\nSteht in der Kopfzeile jeder Telegram-Nachricht, damit Sie sofort sehen, welcher Server meldet.\n\n%s' "$lbl_disp" "$sec_info")
+      opt_info[5]=$(printf '5) BAUSTEIN: FAIL2BAN (TG_FAIL2BAN)\n\nHaelt die Einstellung TG_FAIL2BAN in /etc/it-reinbek/telegram.conf vor und bindet (falls fail2ban installiert ist) sofort /etc/fail2ban/action.d/it-reinbek-telegram.conf ein, damit IP-Sperren gemeldet werden.\n\n%s' "$sec_info")
+      opt_info[6]=$(printf '6) BAUSTEIN: RKHUNTER (TG_RKHUNTER)\n\nHaelt die Einstellung TG_RKHUNTER in /etc/it-reinbek/telegram.conf vor und richtet den täglichen Wrapper /etc/cron.daily/rkhunter-it-reinbek ein, der bei Rootkit-Warnungen sofort per Telegram informiert.\n\n%s' "$sec_info")
+      opt_info[7]=$(printf '7) BAUSTEIN: CLAMAV (TG_CLAMAV)\n\nMeldet Viren- und Webshell-Funde von ClamAV sofort per Telegram (sowohl im Echtzeit-Modus ueber it-reinbek-clamwatch.service als auch beim naechtlichen Cronjob-Scan ueber clamav-scan.sh).\n\n%s' "$sec_info")
+      opt_info[8]=$(printf '8) BAUSTEIN: AUDITD (TG_AUDITD - php2shell_exec)\n\nMeldet verdächtige Programm-/Shell-Starts durch Webserver-User (www-data, apache, nginx) in Echtzeit ueber it-reinbek-auditwatch.service - auch dann, wenn auditd bereits vorher auf dem Server eingerichtet war!\n\n%s' "$sec_info")
+      opt_info[9]=$(printf '9) VERBINDUNGSTEST (getMe & getChat - rein lesend)\n\nDruecken Sie [Leertaste] oder [t], um Bot-Token und Chat-ID sofort lesend gegen api.telegram.org zu pruefen.\n\n%s' "$sec_info")
+    fi
+
+    opt_badge[1]=$( [ "$TG_ON" -eq 1 ] && echo "[JA/ON]" || echo "[NEIN/OFF]" )
+    opt_badge[2]="[Edit]"
+    opt_badge[3]="[Edit]"
+    opt_badge[4]="[Edit]"
+    opt_badge[5]=$( [ "$TG_F2B" -eq 1 ] && echo "[JA]" || echo "[NEIN]" )
+    opt_badge[6]=$( [ "$TG_RKH" -eq 1 ] && echo "[JA]" || echo "[NEIN]" )
+    opt_badge[7]=$( [ "$TG_CLAM" -eq 1 ] && echo "[JA]" || echo "[NEIN]" )
+    if [ -f "$AUDIT_RULE" ]; then
+      opt_badge[8]=$( [ "$TG_AUDIT" -eq 1 ] && echo "[JA, auditd aktiv]" || echo "[NEIN, auditd aktiv]" )
+    else
+      opt_badge[8]=$( [ "$TG_AUDIT" -eq 1 ] && echo "[JA]" || echo "[NEIN]" )
+    fi
+    opt_badge[9]="[Test]"
+
+    local -a rlines=()
+    local rline wline
+    while IFS= read -r rline; do
+      if [ -z "$rline" ]; then
+        rlines+=("")
+      else
+        while IFS= read -r wline; do
+          rlines+=("$wline")
+        done < <(printf '%s\n' "$rline" | fold -s -w "$r_inner")
+      fi
+    done <<< "${opt_info[$sel]}"
+
+    local r_total="${#rlines[@]}"
+    local rmax=$(( r_total - box_h ))
+    [ "$rmax" -lt 0 ] && rmax=0
+    [ "$iscroll" -gt "$rmax" ] && iscroll="$rmax"
+    [ "$iscroll" -lt 0 ] && iscroll=0
+    local r_more_up=0 r_more_dn=0
+    [ "$iscroll" -gt 0 ] && r_more_up=1
+    [ $(( iscroll + box_h )) -lt "$r_total" ] && r_more_dn=1
+
+    local rup_s="" rdn_s=""
+    if [ "$r_more_up" -eq 1 ]; then rup_s=$( [ "$UI_LANG" = "en" ] && echo " ^more " || echo " ^mehr " ); fi
+    if [ "$r_more_dn" -eq 1 ]; then rdn_s=$( [ "$UI_LANG" = "en" ] && echo " PgDn v more " || echo " Bild v mehr " ); fi
+
+    local l_fill_top=$(( lw - ${#l_box_title} - 4 ))
+    [ "$l_fill_top" -lt 1 ] && l_fill_top=1
+    local r_fill_top=$(( rw - ${#r_box_title} - ${#rup_s} - 4 ))
+    [ "$r_fill_top" -lt 1 ] && r_fill_top=1
+
+    printf '\e[H\e[2J'
+    tui_topbar "$cols" " IT-Reinbek PHP2Shell-Auditor v${VERSION}" "$step_title"
+    printf '%s\n' "${intro_line:0:$cols}"
+    printf '%s+-- %s%s%s %s++-- %s%s%s %s%s%s%s+%s\n' \
+      "$C" "$C$B" "$l_box_title" "$N$C" "$(printf '%*s' "$l_fill_top" '' | tr ' ' '-')" \
+      "$C$B" "$r_box_title" "$N$C" "$(printf '%*s' "$r_fill_top" '' | tr ' ' '-')" "$Y" "$rup_s" "$C" "$N"
+
+    local row idx mark item_color badge title max_tlen lstr raw_len pad_len lpad rstr r_pad rfmt
+    for (( row=0; row<box_h; row++ )); do
+      idx=$(( row + 1 ))
+      rstr="${rlines[$(( iscroll + row ))]:-}"
+      if [ "$idx" -le 9 ]; then
+        item_color=""
+        mark=" "
+        case "$idx" in
+          1)
+            if [ "$TG_ON" -eq 1 ] && [ "$TG_CUR" -eq 1 ]; then mark="x"; item_color="$G"
+            elif [ "$TG_ON" -eq 1 ] && [ "$TG_CUR" -eq 0 ]; then mark="+"; item_color="${Y}${B}"
+            elif [ "$TG_ON" -eq 0 ] && [ "$TG_CUR" -eq 1 ]; then mark="-"; item_color="${R}${B}"
+            else mark=" "; item_color=""
+            fi
+            ;;
+          2)
+            if [ -n "$TG_TOKEN_IN" ]; then mark="x"; item_color="$G"; else mark=" "; item_color="${Y}"; fi
+            ;;
+          3)
+            if [ -n "$TG_CHAT_IN" ]; then mark="x"; item_color="$G"; else mark=" "; item_color="${Y}"; fi
+            ;;
+          4)
+            if [ -n "$TG_LABEL_IN" ]; then mark="x"; item_color="$G"; else mark=" "; fi
+            ;;
+          5)
+            if [ "$TG_F2B" -eq 1 ]; then mark="x"; item_color="$G"; else mark=" "; fi
+            ;;
+          6)
+            if [ "$TG_RKH" -eq 1 ]; then mark="x"; item_color="$G"; else mark=" "; fi
+            ;;
+          7)
+            if [ "$TG_CLAM" -eq 1 ]; then mark="x"; item_color="$G"; else mark=" "; fi
+            ;;
+          8)
+            if [ "$TG_AUDIT" -eq 1 ]; then mark="x"; item_color="$G"; else mark=" "; fi
+            ;;
+          9)
+            mark="t"; item_color="$C"
+            ;;
+        esac
+
+        badge="${opt_badge[$idx]}"
+        title="${opt_title[$idx]}"
+        max_tlen=$(( lw - 12 - ${#badge} ))
+        [ "$max_tlen" -lt 10 ] && max_tlen=10
+        title="${title:0:$max_tlen}"
+        if [ "$idx" -eq "$sel" ]; then
+          lstr=" > [$mark] $idx) $title"
+        else
+          lstr="   [$mark] $idx) $title"
+        fi
+        raw_len=$(( ${#lstr} + ${#badge} + 1 ))
+        pad_len=$(( lw - raw_len ))
+        [ "$pad_len" -lt 1 ] && pad_len=1
+        lstr="${lstr}$(printf '%*s' "$pad_len" '')${badge} "
+        if [ "$idx" -eq "$sel" ]; then
+          if [ -n "$item_color" ]; then
+            lpad=$'\e[7m'"${item_color}${B}${lstr}"$'\e[0m'
+          else
+            lpad=$'\e[7m'"${B}${lstr}"$'\e[0m'
+          fi
+        elif [ -n "$item_color" ]; then
+          lpad="${item_color}${lstr}${N}"
+        else
+          lpad="${lstr}"
+        fi
+      else
+        lpad=$(printf '%*s' "$lw" '')
+      fi
+
+      rstr="${rstr:0:$r_inner}"
+      r_pad=$(( r_inner - ${#rstr} ))
+      [ "$r_pad" -lt 0 ] && r_pad=0
+      case "$rstr" in
+        [1-9]\)\ *)
+          rfmt=" ${B}${rstr}${N}$(printf '%*s' "$r_pad" '') " ;;
+        SICHERE\ ABLAGE*|SECURE\ STORAGE*|Vorab-Abfrage:*|Question\ before*)
+          rfmt=" ${B}${C}${rstr}${N}$(printf '%*s' "$r_pad" '') " ;;
+        *)
+          rfmt=" ${rstr}$(printf '%*s' "$r_pad" '') " ;;
+      esac
+      printf '%s|%s%s%s||%s%s%s|%s\n' "$C" "$N" "$lpad" "$C" "$N" "$rfmt" "$C" "$N"
+    done
+
+    local r_fill_bot=$(( rw - ${#rdn_s} ))
+    [ "$r_fill_bot" -lt 1 ] && r_fill_bot=1
+    printf '%s+%s++%s%s%s%s+%s\n' \
+      "$C" "$(printf '%*s' "$lw" '' | tr ' ' '-')" \
+      "$(printf '%*s' "$r_fill_bot" '' | tr ' ' '-')" "$Y" "$rdn_s" "$C" "$N"
+    printf '%s%s%s\n' "$C" "${status_line:0:$cols}" "$N"
+    printf '%s%s%s' "$B" "${key_line:0:$cols}" "$N"
+
+    IFS= tty_read -rsn1 key || return 0
+    if [[ "$key" == $'\e' ]]; then
+      IFS= tty_read -rsn1 -t 0.05 k2 || k2=""
+      if [[ "$k2" == "[" ]]; then
+        IFS= tty_read -rsn1 -t 0.05 k3 || k3=""
+        case "$k3" in
+          A) sel=$(( sel > 1 ? sel - 1 : 9 )); iscroll=0 ;;
+          B) sel=$(( sel < 9 ? sel + 1 : 1 )); iscroll=0 ;;
+          5) IFS= tty_read -rsn1 -t 0.02 _ || true; iscroll=$(( iscroll > 5 ? iscroll - 5 : 0 )) ;;
+          6) IFS= tty_read -rsn1 -t 0.02 _ || true; iscroll=$(( iscroll + 5 )) ;;
+        esac
+      fi
+      continue
+    fi
+
+    case "$key" in
+      k|K) sel=$(( sel > 1 ? sel - 1 : 9 )); iscroll=0 ;;
+      j|J) sel=$(( sel < 9 ? sel + 1 : 1 )); iscroll=0 ;;
+      [1-9]) sel="$key"; iscroll=0 ;;
+      l|L)
+        if [ "$UI_LANG" = "de" ]; then UI_LANG="en"; else UI_LANG="de"; fi
+        ;;
+      t|T)
+        if ! tg_valid_token "$TG_TOKEN_IN"; then
+          status_msg="FEHLER: Bitte zuerst ein gueltiges Bot-Token (Punkt 2) eingeben!"
+        else
+          status_msg="Pruefe Bot-Token & Chat-ID lesend gegen api.telegram.org ..."
+          if tg_check_token "$TG_TOKEN_IN"; then
+            if tg_valid_chat "$TG_CHAT_IN"; then
+              if tg_check_chat "$TG_TOKEN_IN" "$TG_CHAT_IN"; then
+                status_msg="OK: Bot (@${TG_BOT_USER:-bot}) und Chat (${TG_CHAT_TITLE:-$TG_CHAT_IN}) erfolgreich verifiziert!"
+              else
+                status_msg="WARNUNG: Bot (@${TG_BOT_USER:-bot}) OK, aber Chat nicht erreichbar (${TG_LAST_ERR:-/start beim Bot gesendet?})."
+              fi
+            else
+              status_msg="OK: Bot (@${TG_BOT_USER:-bot}) verifiziert! Bitte noch Chat-ID (Punkt 3) eintragen."
+            fi
+          else
+            status_msg="FEHLER: Bot-Token ungueltig oder kein Internet (${TG_LAST_ERR:-Pruefung fehlgeschlagen})."
+          fi
+        fi
+        ;;
+      " ")
+        case "$sel" in
+          1)
+            TG_ON=$(( 1 - TG_ON ))
+            if [ "$TG_ON" -eq 1 ] && [ -z "$TG_TOKEN_IN" ]; then
+              printf '\n%sBot-Token (Eingabe verdeckt, Enter bestaetigt):%s ' "$B$Y" "$N"
+              tty_read -rs val || val=""
+              echo ""
+              if [ -n "$val" ]; then
+                if tg_valid_token "$val"; then
+                  TG_TOKEN_IN="$val"
+                  status_msg="Bot-Token uebernommen."
+                else
+                  status_msg="Ungueltiges Token-Format (erwartet: 123456789:AAH...)."
+                fi
+              fi
+              if [ -z "$TG_CHAT_IN" ]; then
+                printf '%sTelegram Chat-ID (z. B. 123456789 oder -100...):%s ' "$B$Y" "$N"
+                tty_read -r val || val=""
+                if [ -n "$val" ] && tg_valid_chat "$val"; then
+                  TG_CHAT_IN="$val"
+                  status_msg="Bot-Token & Chat-ID uebernommen."
+                fi
+              fi
+            fi
+            ;;
+          2)
+            printf '\n%sBot-Token (Eingabe verdeckt, leer = unveraendert):%s ' "$B$Y" "$N"
+            tty_read -rs val || val=""
+            echo ""
+            if [ -n "$val" ]; then
+              if tg_valid_token "$val"; then
+                TG_TOKEN_IN="$val"
+                TG_ON=1
+                status_msg="Bot-Token aktualisiert."
+              else
+                status_msg="Ungueltiges Token-Format (erwartet: 123456789:AAH...)."
+              fi
+            fi
+            ;;
+          3)
+            printf '\n%sTelegram Chat-ID [%s]:%s ' "$B$Y" "${TG_CHAT_IN:-}" "$N"
+            tty_read -r val || val=""
+            if [ -n "$val" ]; then
+              if tg_valid_chat "$val"; then
+                TG_CHAT_IN="$val"
+                TG_ON=1
+                status_msg="Chat-ID aktualisiert: $val"
+              else
+                status_msg="Ungueltige Chat-ID (nur Ziffern, optional fuehrendes Minus)."
+              fi
+            fi
+            ;;
+          4)
+            printf '\n%sServer-Name / Label [%s]:%s ' "$B$Y" "$lbl_disp" "$N"
+            tty_read -r val || val=""
+            if [ -n "$val" ]; then
+              if tg_valid_label "$val"; then
+                TG_LABEL_IN="$val"
+                status_msg="Server-Label aktualisiert: $val"
+              else
+                status_msg="Ungueltiges Label (max. 64 Zeichen, keine Anfuehrungszeichen/Zeilenumbrueche)."
+              fi
+            fi
+            ;;
+          5) TG_F2B=$(( 1 - TG_F2B )) ;;
+          6) TG_RKH=$(( 1 - TG_RKH )) ;;
+          7) TG_CLAM=$(( 1 - TG_CLAM )); CLAM_TG_WANT="$TG_CLAM" ;;
+          8) TG_AUDIT=$(( 1 - TG_AUDIT )); AUDIT_TG_WANT="$TG_AUDIT" ;;
+          9)
+            if tg_valid_token "$TG_TOKEN_IN" && tg_check_token "$TG_TOKEN_IN"; then
+              if tg_valid_chat "$TG_CHAT_IN" && tg_check_chat "$TG_TOKEN_IN" "$TG_CHAT_IN"; then
+                status_msg="OK: Bot (@${TG_BOT_USER:-bot}) & Chat (${TG_CHAT_TITLE:-$TG_CHAT_IN}) erreichbar!"
+              else
+                status_msg="Bot (@${TG_BOT_USER:-bot}) OK, Chat-Pruefung: ${TG_LAST_ERR:-Chat-ID pruefen}"
+              fi
+            else
+              status_msg="FEHLER: ${TG_LAST_ERR:-Bitte gueltiges Bot-Token unter 2) eingeben}"
+            fi
+            ;;
+        esac
+        ;;
+      b|B|q|Q)
+        load_menu_texts
+        return 0
+        ;;
+      "")
+        if [ "$TG_ON" -eq 1 ]; then
+          if ! tg_valid_token "$TG_TOKEN_IN" || ! tg_valid_chat "$TG_CHAT_IN"; then
+            status_msg="Bitte erst Bot-Token (2) und Chat-ID (3) eingeben (oder Punkt 1 mit Leertaste abwaehlen)!"
+            continue
+          fi
+          M_SEL[18]=1
+          CLAM_TG_WANT="$TG_CLAM"
+          AUDIT_TG_WANT="$TG_AUDIT"
+          # Falls Telegram bereits aktiv war, aber Einstellungen geändert wurden -> als [+] zur Aktualisierung vormerken
+          if [ "$TG_CUR" -eq 1 ]; then
+            if [ "$TG_TOKEN_IN" != "$(tg_conf_get TG_TOKEN)" ] || \
+               [ "$TG_CHAT_IN" != "$(tg_conf_get TG_CHAT_ID)" ] || \
+               [ "$TG_LABEL_IN" != "$(tg_conf_get TG_LABEL)" ] || \
+               [ "$TG_F2B" != "$(tg_conf_get TG_FAIL2BAN)" ] || \
+               [ "$TG_RKH" != "$(tg_conf_get TG_RKHUNTER)" ] || \
+               [ "$TG_CLAM" != "$(tg_conf_get TG_CLAMAV)" ] || \
+               [ "$TG_AUDIT" != "$(tg_conf_get TG_AUDITD)" ]; then
+              M_ACTIVE[18]=0
+            fi
+          fi
+          # Falls auditd bereits auf dem Server aktiv ist und Telegram für auditd gewünscht ist -> direkt vormerken!
+          if [ -f "$AUDIT_RULE" ]; then
+            if [ "$TG_AUDIT" -eq 1 ] && ! systemctl is-active --quiet it-reinbek-auditwatch.service 2>/dev/null; then
+              M_ACTIVE[13]=0
+              M_SEL[13]=1
+            elif [ "$TG_AUDIT" -eq 0 ] && systemctl is-active --quiet it-reinbek-auditwatch.service 2>/dev/null; then
+              M_ACTIVE[13]=0
+              M_SEL[13]=1
+            fi
+          fi
+        else
+          M_SEL[18]=0
+        fi
         load_menu_texts
         return 0
         ;;
@@ -3939,6 +5271,7 @@ tui_befund_screen() {
   while true; do
     clam_recommend
     clam_mode_detect
+    tg_init
     local cols rows box_h text_w
     cols=$(tput cols 2>/dev/null || echo 118)
     rows=$(tput lines 2>/dev/null || echo 34)
@@ -3948,12 +5281,12 @@ tui_befund_screen() {
     text_w=$(( cols - 6 ))
 
     local step_title box_title status_line key_line rec_line
-    local s_php s_dk s_stale s_att s_comp s_mit s_sess s_aud s_clam
+    local s_php s_dk s_stale s_att s_comp s_mit s_sess s_aud s_clam s_tg
     if [ "$UI_LANG" = "en" ]; then
-      step_title="Step 2/3 - System Audit & Findings "
+      step_title="Step 2/4 - System Audit & Findings "
       box_title="Info"
-      status_line=" Read-only system audit completed. Review findings below and press [Enter] to open the Remediation Menu."
-      key_line=" Up/Down/PgDn: scroll | Enter: Continue (Menu) | l: Language (DE/EN) | p/r: Print Report | q: Quit"
+      status_line=" Read-only system audit completed. Review findings below and press [Enter] for Step 3/4 (Telegram Bot & Menu)."
+      key_line=" Up/Down/PgDn: scroll | Enter: Continue (Telegram & Menu) | t: Telegram | l: DE/EN | p/r: Print | q: Quit"
 
       if [ "$COMP" -gt 0 ]; then
         rec_line="${R}${B}SUSPECTED COMPROMISE!${N} Recommended: [1] Preserve evidence -> Disconnect -> [3/4/6] Patch -> [10] Restart -> [12] Quarantine -> [11] Sessions -> [15] Rotate secrets."
@@ -3964,7 +5297,7 @@ tui_befund_screen() {
       elif [ "$STALE" -gt 0 ]; then
         rec_line="${Y}${B}Patched on disk, but services still run old PHP in RAM.${N} Recommended: [10] Restart PHP-FPM / web services."
       else
-        rec_line="${G}${B}No immediate action required.${N} Optional: [13] auditd monitoring, [17] ClamAV protection, [15] Print audit report."
+        rec_line="${G}${B}No immediate action required.${N} Optional: [13] auditd monitoring, [17] ClamAV protection, [18] Telegram alerts, [15] Print audit report."
       fi
 
       if [ "${#NEED_UPDATE[@]}" -gt 0 ]; then s_php="${R}${B}VULNERABLE (${#NEED_UPDATE[@]} package/binary target(s))${N}"; else s_php="${G}${B}PATCHED / OK${N}"; fi
@@ -3979,11 +5312,16 @@ tui_befund_screen() {
       else
         s_clam="[ ] Inactive | RAM suggestion: ${Y}${B}${CLAM_REC}${N} (~${CLAM_EFF_MB} MB free)"
       fi
+      if [ "$TG_CUR" -eq 1 ]; then
+        s_tg="${G}${B}[x] Configured (${TG_CONF}, 0600)${N} | Modules: $(tg_cat_text "$TG_F2B" "$TG_RKH" "$TG_CLAM" "$TG_AUDIT")"
+      else
+        s_tg="[ ] Not configured yet (will be asked in Step 3/4)"
+      fi
     else
-      step_title="Schritt 2/3 - Systempruefung & Befund "
+      step_title="Schritt 2/4 - Systempruefung & Befund "
       box_title="Info"
-      status_line=" Lesende Systempruefung abgeschlossen. Befund pruefen und mit [Enter] weiter zur Massnahmen-Auswahl."
-      key_line=" Pfeile/Bild: scrollen | Enter: Weiter (Menue) | l: Sprache (DE/EN) | p/r: Drucken | q: Abbruch"
+      status_line=" Lesende Systempruefung abgeschlossen. Befund pruefen und mit [Enter] weiter zu Schritt 3/4 (Telegram-Bot & Menue)."
+      key_line=" Pfeile/Bild: scrollen | Enter: Weiter (Telegram & Menue) | t: Telegram | l: DE/EN | p/r: Drucken | q: Abbruch"
 
       if [ "$COMP" -gt 0 ]; then
         rec_line="${R}${B}VERDACHT AUF BEFALL!${N} Empfehlung: [1] Beweise sichern -> Vom Netz trennen -> [3/4/6] Update -> [10] Dienste neu starten -> [12] Quarantaene -> [11] Sessions -> [15] Secrets rotieren."
@@ -3994,7 +5332,7 @@ tui_befund_screen() {
       elif [ "$STALE" -gt 0 ]; then
         rec_line="${Y}${B}Gepatcht, aber Dienste laufen noch mit altem Code im RAM.${N} Empfohlen: [10] Dienste neu starten."
       else
-        rec_line="${G}${B}Kein unmittelbarer Handlungsbedarf erkannt.${N} Optional: [13] auditd-Ueberwachung, [17] ClamAV-Schutz, [15] Revisionsbericht drucken."
+        rec_line="${G}${B}Kein unmittelbarer Handlungsbedarf erkannt.${N} Optional: [13] auditd-Ueberwachung, [17] ClamAV-Schutz, [18] Telegram-Bot, [15] Revisionsbericht drucken."
       fi
 
       if [ "${#NEED_UPDATE[@]}" -gt 0 ]; then s_php="${R}${B}VERWUNDBAR (${#NEED_UPDATE[@]} Ziel(e))${N}"; else s_php="${G}${B}GEPATCHT / OK${N}"; fi
@@ -4009,11 +5347,24 @@ tui_befund_screen() {
       else
         s_clam="[ ] Inaktiv | RAM-Vorschlag: ${Y}${B}${CLAM_REC}${N} (~${CLAM_EFF_MB} MB frei)"
       fi
+      if [ "$TG_CUR" -eq 1 ]; then
+        s_tg="${G}${B}[x] Eingerichtet (${TG_CONF}, 0600)${N} | Bausteine: $(tg_cat_text "$TG_F2B" "$TG_RKH" "$TG_CLAM" "$TG_AUDIT")"
+      else
+        s_tg="[ ] Noch nicht eingerichtet (wird im naechsten Schritt 3/4 abgefragt)"
+      fi
     fi
 
     if [ "${M_ACTIVE[7]:-0}" -eq 1 ]; then s_mit="${G}${B}[x] $( [ "$UI_LANG" = "en" ] && echo "Active" || echo "Aktiv" )${N}"; else s_mit="[ ] $( [ "$UI_LANG" = "en" ] && echo "Inactive" || echo "Inaktiv" )"; fi
     if [ "${M_ACTIVE[8]:-0}" -eq 1 ]; then s_sess="${G}${B}[x] $( [ "$UI_LANG" = "en" ] && echo "Active" || echo "Aktiv" )${N}"; else s_sess="[ ] $( [ "$UI_LANG" = "en" ] && echo "Inactive" || echo "Inaktiv" )"; fi
-    if [ "${M_ACTIVE[13]:-0}" -eq 1 ]; then s_aud="${G}${B}[x] $( [ "$UI_LANG" = "en" ] && echo "Active" || echo "Aktiv" )${N}"; else s_aud="[ ] $( [ "$UI_LANG" = "en" ] && echo "Inactive" || echo "Inaktiv" )"; fi
+    if [ "${M_ACTIVE[13]:-0}" -eq 1 ]; then
+      if systemctl is-active --quiet it-reinbek-auditwatch.service 2>/dev/null; then
+        s_aud="${G}${B}[x] $( [ "$UI_LANG" = "en" ] && echo "Active (+ Telegram)" || echo "Aktiv (+ Telegram)" )${N}"
+      else
+        s_aud="${G}${B}[x] $( [ "$UI_LANG" = "en" ] && echo "Active (local only)" || echo "Aktiv (nur lokal)" )${N}"
+      fi
+    else
+      s_aud="[ ] $( [ "$UI_LANG" = "en" ] && echo "Inactive" || echo "Inaktiv" )"
+    fi
 
     local -a blines=()
     blines+=("")
@@ -4021,10 +5372,10 @@ tui_befund_screen() {
     blines+=("")
     if [ "$UI_LANG" = "en" ]; then
       blines+=("  This tool audits the server for ${B}CVE-2026-109618 & CVE-2026-109619 (PHP2Shell)${N} per BSI advisory.")
-      blines+=("  No changes have been made yet. You decide in the next step which actions to apply or roll back.")
+      blines+=("  No changes have been made yet. You decide in the next steps which actions to apply or roll back.")
     else
       blines+=("  Dieses Werkzeug prueft den Server auf ${B}CVE-2026-109618 & CVE-2026-109619 (PHP2Shell)${N} gemaess BSI-Warnung.")
-      blines+=("  Es wurde noch nichts veraendert. Sie entscheiden im naechsten Schritt selbst, was umgesetzt wird.")
+      blines+=("  Es wurde noch nichts veraendert. Sie entscheiden in den naechsten Schritten selbst, was umgesetzt wird.")
     fi
     blines+=("")
 
@@ -4043,6 +5394,7 @@ tui_befund_screen() {
       blines+=("    Compromise / Webshells     : $s_comp")
       blines+=("    BSI Workarounds (#7/#8)    : INI Drop-in: $s_mit | Session Storage: $s_sess | Auditd (#13): $s_aud")
       blines+=("    ClamAV Protection (#17)    : $s_clam")
+      blines+=("    Telegram Bot Alerts (#18)  : $s_tg")
       blines+=("")
       blines+=("  ${C}${B}DETAILED SCAN LOG (scroll with Up/Down/PgDn):${N}")
       blines+=("  $(printf '%*s' "$((text_w - 4))" '' | tr ' ' '-')")
@@ -4055,6 +5407,7 @@ tui_befund_screen() {
       blines+=("    Kompromittierung/Webshells : $s_comp")
       blines+=("    BSI-Workarounds (#7/#8)    : INI-Drop-in: $s_mit | Session-Schutz: $s_sess | Auditd (#13): $s_aud")
       blines+=("    ClamAV Malwareschutz (#17) : $s_clam")
+      blines+=("    Telegram-Bot Meldung (#18) : $s_tg")
       blines+=("")
       blines+=("  ${C}${B}DETAILLIERTER SCAN-BERICHT (mit Pfeiltasten / Bild-ab scrollen):${N}")
       blines+=("  $(printf '%*s' "$((text_w - 4))" '' | tr ' ' '-')")
@@ -4122,6 +5475,9 @@ tui_befund_screen() {
       k|K) scroll=$(( scroll - 1 )) ;;
       j|J) scroll=$(( scroll + 1 )) ;;
       " ") scroll=$(( scroll + box_h / 2 )) ;;
+      t|T)
+        tui_telegram_screen "sub"
+        ;;
       l|L)
         if [ "$UI_LANG" = "de" ]; then UI_LANG="en"; else UI_LANG="de"; fi
         load_menu_texts 2>/dev/null || true
@@ -4169,7 +5525,7 @@ tui_render() {
 
   if [ "$UI_LANG" = "en" ]; then
     if [ "${M_ACTIVE[$cur]}" -eq 1 ] && [ "${M_SEL[$cur]}" -eq 1 ]; then
-      state_txt="ACTIVE / CONFIGURED [x] (Press Space to mark for ROLLBACK [-])"
+      state_txt="ACTIVE / CONFIGURED [x] (Press Space to mark for ROLLBACK [-] or adjust sub-options)"
     elif [ "${M_ACTIVE[$cur]}" -eq 1 ] && [ "${M_SEL[$cur]}" -eq 0 ]; then
       state_txt="MARKED FOR ROLLBACK [-] (will be reverted on [Enter]!)"
     elif [ "${M_ACTIVE[$cur]}" -eq 0 ] && [ "${M_SEL[$cur]}" -eq 1 ]; then
@@ -4179,7 +5535,7 @@ tui_render() {
     fi
   else
     if [ "${M_ACTIVE[$cur]}" -eq 1 ] && [ "${M_SEL[$cur]}" -eq 1 ]; then
-      state_txt="AKTIV / KONFIGURIERT [x] (Abwaehlen mit Leertaste markiert zur RUECKABWICKLUNG [-])"
+      state_txt="AKTIV / KONFIGURIERT [x] (Leertaste markiert zur RUECKABWICKLUNG [-] bzw. oeffnet Optionen)"
     elif [ "${M_ACTIVE[$cur]}" -eq 1 ] && [ "${M_SEL[$cur]}" -eq 0 ]; then
       state_txt="ZUR RUECKABWICKLUNG VORGEMERKT [-] (wird bei [Enter] rueckgaengig gemacht!)"
     elif [ "${M_ACTIVE[$cur]}" -eq 0 ] && [ "${M_SEL[$cur]}" -eq 1 ]; then
@@ -4222,7 +5578,7 @@ tui_render() {
 
   local -a llines=()
   local last_cat="" cur_row_idx=0
-  for i in {1..17}; do
+  for i in {1..18}; do
     if [ "${M_CAT[$i]}" != "$last_cat" ]; then
       last_cat="${M_CAT[$i]}"
       llines+=("CAT|$last_cat")
@@ -4253,7 +5609,7 @@ tui_render() {
   [ $(( iscroll + box_h )) -lt "$r_total" ] && r_more_dn=1
 
   local count_new=0 count_undo=0 count_act=0
-  for i in {1..17}; do
+  for i in {1..18}; do
     [ "${M_ACTIVE[$i]}" -eq 1 ] && count_act=$(( count_act + 1 ))
     if [ "${M_ACTIVE[$i]}" -eq 0 ] && [ "${M_SEL[$i]}" -eq 1 ]; then count_new=$(( count_new + 1 )); fi
     if [ "${M_ACTIVE[$i]}" -eq 1 ] && [ "${M_SEL[$i]}" -eq 0 ]; then count_undo=$(( count_undo + 1 )); fi
@@ -4261,17 +5617,17 @@ tui_render() {
 
   local step_title l_box_title r_box_title status_line key_line
   if [ "$UI_LANG" = "en" ]; then
-    step_title="Step 3/3 - Remediation (CRIT:${CRIT} WARN:${WARN} COMP:${COMP}) "
-    l_box_title="Selection (1-17)"
+    step_title="Step 4/4 - Remediation (CRIT:${CRIT} WARN:${WARN} COMP:${COMP}) "
+    l_box_title="Selection (1-18)"
     r_box_title="Info"
     status_line=" Active [x]: ${count_act} | Marked for activation [+]: ${count_new} | Marked for rollback [-]: ${count_undo} | Enter applies changes."
-    key_line=" Arrows: select | Space: [x]/[+]/[-] | c: ClamAV | PgUp/Dn: Info | Enter: Apply | b: Findings | l: DE/EN | q: Quit"
+    key_line=" Arrows: select | Space: [x]/[+]/[-] | t: Telegram | c: ClamAV | Enter: Apply | b: Findings | l: DE/EN | q: Quit"
   else
-    step_title="Schritt 3/3 - Massnahmen (CRIT:${CRIT} WARN:${WARN} COMP:${COMP}) "
-    l_box_title="Auswahl (1-17)"
+    step_title="Schritt 4/4 - Massnahmen (CRIT:${CRIT} WARN:${WARN} COMP:${COMP}) "
+    l_box_title="Auswahl (1-18)"
     r_box_title="Info"
     status_line=" Aktiv [x]: ${count_act} | Zur Aktivierung [+]: ${count_new} | Zur Rueckabwicklung [-]: ${count_undo} | Enter fuehrt Aenderungen aus."
-    key_line=" Pfeile: Wahl | Leertaste: [x]/[+]/[-] | c: ClamAV | Bild^/v: Info | Enter: Weiter | b: Befund | l: DE/EN | q: Ende"
+    key_line=" Pfeile: Wahl | Leertaste: [x]/[+]/[-] | t: Telegram | c: ClamAV | Enter: Weiter | b: Befund | l: DE/EN | q: Ende"
   fi
 
   printf '\e[H\e[2J'
@@ -4415,10 +5771,13 @@ interactive_menu() {
   ensure_state_dir
   init_menu_data
 
-  # Schritt 2/3: Befund-Screen im Box-TUI anzeigen (Abbrechen mit q beendet sauber)
+  # Schritt 2/4: Befund-Screen im Box-TUI anzeigen (Abbrechen mit q beendet sauber)
   if ! tui_befund_screen; then
     return 0
   fi
+
+  # Schritt 3/4: Vorab-Abfrage Telegram-Bot & Baustein-Benachrichtigungen (fail2ban, rkhunter, ClamAV, auditd)
+  tui_telegram_screen "wizard"
 
   local cur=1 iscroll=0 key k2 k3 num_buf="" i has_changes
   while true; do
@@ -4430,8 +5789,8 @@ interactive_menu() {
       if [[ "$k2" == "[" ]]; then
         IFS= tty_read -rsn1 -t 0.05 k3 || k3=""
         case "$k3" in
-          A) cur=$(( cur > 1 ? cur - 1 : 17 )); iscroll=0 ;;
-          B) cur=$(( cur < 17 ? cur + 1 : 1 )); iscroll=0 ;;
+          A) cur=$(( cur > 1 ? cur - 1 : 18 )); iscroll=0 ;;
+          B) cur=$(( cur < 18 ? cur + 1 : 1 )); iscroll=0 ;;
           5) IFS= tty_read -rsn1 -t 0.02 _ || true; iscroll=$(( iscroll > 5 ? iscroll - 5 : 0 )) ;;
           6) IFS= tty_read -rsn1 -t 0.02 _ || true; iscroll=$(( iscroll + 5 )) ;;
         esac
@@ -4440,12 +5799,17 @@ interactive_menu() {
     fi
 
     case "$key" in
-      k|K) cur=$(( cur > 1 ? cur - 1 : 17 )); iscroll=0 ;;
-      j|J) cur=$(( cur < 17 ? cur + 1 : 1 )); iscroll=0 ;;
+      k|K) cur=$(( cur > 1 ? cur - 1 : 18 )); iscroll=0 ;;
+      j|J) cur=$(( cur < 18 ? cur + 1 : 1 )); iscroll=0 ;;
       c|C)
         cur=17
         iscroll=0
         tui_clamav_screen
+        ;;
+      t|T)
+        cur=18
+        iscroll=0
+        tui_telegram_screen "sub"
         ;;
       b|B)
         if ! tui_befund_screen; then
@@ -4458,8 +5822,12 @@ interactive_menu() {
         load_menu_texts
         ;;
       " ")
-        if [ "$cur" -eq 17 ]; then
+        if [ "$cur" -eq 13 ]; then
+          tui_auditd_screen
+        elif [ "$cur" -eq 17 ]; then
           tui_clamav_screen
+        elif [ "$cur" -eq 18 ]; then
+          tui_telegram_screen "sub"
         elif [ "${M_ACTIVE[$cur]}" -eq 1 ] && [ "${M_REVERSIBLE[$cur]}" -eq 0 ]; then
           M_ACTIVE[$cur]=0; M_SEL[$cur]=1
         else
@@ -4488,14 +5856,18 @@ interactive_menu() {
         break
         ;;
       [0-9])
-        printf '\nNummer (1-17), Enter bestätigt: %s' "$key"
+        printf '\nNummer (1-18), Enter bestätigt: %s' "$key"
         tty_read -r -t 2 num_buf || num_buf=""
         num_buf="${key}${num_buf}"
-        if [[ "$num_buf" =~ ^[0-9]+$ ]] && [ "$num_buf" -ge 1 ] && [ "$num_buf" -le 17 ]; then
+        if [[ "$num_buf" =~ ^[0-9]+$ ]] && [ "$num_buf" -ge 1 ] && [ "$num_buf" -le 18 ]; then
           cur="$num_buf"
           iscroll=0
-          if [ "$cur" -eq 17 ]; then
+          if [ "$cur" -eq 13 ]; then
+            tui_auditd_screen
+          elif [ "$cur" -eq 17 ]; then
             tui_clamav_screen
+          elif [ "$cur" -eq 18 ]; then
+            tui_telegram_screen "sub"
           else
             M_SEL[$cur]=$(( 1 - M_SEL[$cur] ))
           fi
@@ -4504,13 +5876,19 @@ interactive_menu() {
       ""|x|X)
         clear
         has_changes=0
-        for i in {1..17}; do
+        for i in {1..18}; do
           if [ "${M_SEL[$i]}" -ne "${M_ACTIVE[$i]}" ]; then has_changes=1; fi
         done
 
         if [ "$has_changes" -eq 0 ]; then
-          if [ "$cur" -eq 17 ]; then
+          if [ "$cur" -eq 13 ]; then
+            tui_auditd_screen
+            continue
+          elif [ "$cur" -eq 17 ]; then
             tui_clamav_screen
+            continue
+          elif [ "$cur" -eq 18 ]; then
+            tui_telegram_screen "sub"
             continue
           elif [ "${M_ACTIVE[$cur]}" -eq 1 ] && [ "${M_REVERSIBLE[$cur]}" -eq 1 ]; then
             hdr "Maßnahme #$cur (${M_TITLE[$cur]}) ist bereits AKTIV [x]"
@@ -4525,7 +5903,13 @@ interactive_menu() {
           fi
         else
           hdr "Wende alle geänderten Checkboxen ([+] Aktivierung / [-] Rückabwicklung) an"
-          for i in {1..17}; do
+          # Falls Telegram (#18) neu aktiviert/aktualisiert wird, zuerst ausführen, damit /usr/local/sbin/it-reinbek-notify bereitsteht
+          if [ "${M_ACTIVE[18]}" -eq 0 ] && [ "${M_SEL[18]}" -eq 1 ]; then
+            printf '\n%s>>> [+] AKTIVIERE Maßnahme #18: %s <<<%s\n' "$B$Y" "${M_TITLE[18]}" "$N"
+            apply_action_by_id 18
+            M_ACTIVE[18]=1
+          fi
+          for i in {1..18}; do
             if [ "${M_ACTIVE[$i]}" -eq 0 ] && [ "${M_SEL[$i]}" -eq 1 ]; then
               printf '\n%s>>> [+] AKTIVIERE Maßnahme #%d: %s <<<%s\n' "$B$Y" "$i" "${M_TITLE[$i]}" "$N"
               apply_action_by_id "$i"
