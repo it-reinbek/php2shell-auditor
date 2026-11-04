@@ -1,12 +1,24 @@
 #!/usr/bin/env bash
 #
-# php2shell-check.sh  (v1.5.0 - Stateful TUI, Reversible Config & Emergency-Patch Edition)
+# php2shell-check.sh  (v1.6.0 - Stateful TUI, Reversible Config & Emergency-Patch Edition)
 # Prüft PHP auf CVE-2026-109618 (GHSA-w8hw-w9fx-j79w) & CVE-2026-109619 (GHSA-6wmf-4rv5-p3rp) ("PHP2Shell"),
 # berücksichtigt den BSI-IT-Sicherheitshinweis BITS-H Nr. 2026-297981-1132 (Version 1.1 vom 21.10.2026),
 # die Notfall-Updates (8.5.12 / 8.4.27 / 8.3.36 / 8.2.35 + EOL-Backports für 7.4 / 8.0 / 8.1)
 # sowie tagesaktuelle Analysen/IOCs (Armis, Abstract Security, Datadog, Sansec, Corelight, IT-Administrator).
 #
-# Neu in v1.5.0:
+# Neu in v1.6.0:
+# - Vierstufige Prozessbaum- & Subprozess-Heuristik (scan_worker_subprocesses):
+#     * Ermittelt dynamisch alle PHP-FPM-, Apache-, nginx-, FrankenPHP-, LiteSpeed-, Caddy- und Lighttpd-Worker-PIDs
+#       sowie deren systemd-Service-cgroups (unabhängig vom jeweiligen Pool-/System-Usernamen).
+#     * Traversiert rekursiv den gesamten PPID-Nachfahrenbaum (Tiefe 1..16) unter allen Web-/PHP-Workern
+#       und erkennt zusätzlich verwaiste Prozesse (PPID=1 / Double-Fork-Orphans) in denselben Webserver-cgroups.
+#     * Führt für jeden Subprozess eine /proc/<pid>-Tiefeninspektion durch (readlink exe inkl. (deleted)/memfd/tmp,
+#       cmdline, cwd, Laufzeit etimes, offene Sockets & PTYs in /proc/<pid>/fd sowie LD_PRELOAD/LD_LIBRARY_PATH in environ).
+#     * Dreistufige Heuristik-Klassifizierung: Whitelist für kurzlaufende Mail-Wrapper (sendmail/postdrop/msmtp),
+#       WARN bei ungewöhnlichen Worker-Subprozessen (sh/bash/curl/wget/Interpreter) und CRIT+COMP bei aktiven
+#       Reverse-/PTY-Shells, argv[0]-Tarnung (Masquerading), Binaries aus /tmp|/dev/shm oder cgroup-Orphans.
+#     * Automatische Forensik-Sicherung aller verdächtigen Subprozess-PIDs in Maßnahme #1 (inkl. Kopie des
+#       laufenden /proc/<pid>/exe-Binaries vor dem Löschen) sowie PROCTITLE-Hex-Dekodierung im auditd-Telegram-Watcher.
 # - Vorab-Abfrage & vollständige Telegram-Bot-Integration (Schritt 3/4 & Maßnahme #18):
 #     * Fragt vor dem Maßnahmen-Menü ab, ob Sicherheits-Infos via Telegram-Bot gesendet werden sollen,
 #       sammelt Bot-Token (verdeckte Eingabe), Chat-ID & Server-Label inkl. lesender API-Prüfung (getMe/getChat).
@@ -47,7 +59,7 @@
 #
 set -uo pipefail
 
-VERSION="1.5.0"
+VERSION="1.6.0"
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 SINCE="2026-10-17"
 REPORT=""
@@ -74,6 +86,7 @@ WEBROOTS=()
 NEED_UPDATE=()
 FOUND_FILES=()
 FOUND_CONF=()
+SUSP_PIDS=()
 CRIT=0
 WARN=0
 COMP=0
@@ -904,6 +917,196 @@ scan_php_internals() {
   fi
 }
 
+scan_worker_subprocesses() {
+  SUSP_PIDS=()
+  local -A is_worker=() is_target=() p_ppid=() p_user=() p_etimes=() p_comm=() p_args=() p_depth=() p_origin=() worker_cgroups=()
+  local pid ppid user etimes comm args cg cg_unit d changed=1
+  local worker_count=0
+
+  # Schicht 1: Laufende PHP-FPM- und Webserver-Master/Worker-PIDs sowie deren systemd-Cgroups dynamisch erfassen
+  while read -r pid ppid user etimes comm args; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    [ "$pid" -eq "$$" ] || [ "$pid" -eq "${BASHPID:-$$}" ] && continue
+    p_ppid[$pid]="$ppid"
+    p_user[$pid]="$user"
+    p_etimes[$pid]="${etimes:-0}"
+    p_comm[$pid]="$comm"
+    p_args[$pid]="$args"
+
+    if [[ "$comm" =~ ^(php-fpm.*|php[0-9.]*-fpm|php-cgi.*|lsphp.*|frankenphp|apache2|httpd|nginx|lighttpd|caddy)$ ]] || \
+       [[ "$args" =~ ^(php-fpm:[[:space:]]*(pool|master)|nginx:[[:space:]]*(worker|master)|(/usr/(local/)?(s?bin)/)?(php-fpm[0-9.]*|php[0-9.]*-fpm|php-cgi[0-9.]*|lsphp[0-9.]*|frankenphp|apache2|httpd|nginx|lighttpd|caddy)([[:space:]]|$)) ]]; then
+      is_worker[$pid]=1
+      worker_count=$((worker_count + 1))
+      if [ -r "/proc/$pid/cgroup" ]; then
+        cg=$(awk -F: '{print $NF}' "/proc/$pid/cgroup" 2>/dev/null | head -n 1)
+        if [[ "$cg" =~ \.(service|scope)$ ]] && [[ ! "$cg" =~ (ssh|sshd|user@|session-|getty|cron|systemd-logind) ]]; then
+          worker_cgroups["$cg"]=1
+        fi
+      fi
+    fi
+  done < <(ps -ww -eo pid=,ppid=,user:32=,etimes=,comm=,args= 2>/dev/null)
+
+  if [ "$worker_count" -eq 0 ]; then
+    info "Subprozess-Heuristik: Keine laufenden PHP-FPM-/Webserver-Worker gefunden."
+    return 0
+  fi
+
+  # Schicht 2a: Rekursiver Nachfahrenbaum (Tiefe 1..16) unter allen Worker-/Master-PIDs
+  for (( d=1; d<=16; d++ )); do
+    changed=0
+    for pid in "${!p_ppid[@]}"; do
+      [ -n "${is_worker[$pid]:-}" ] && continue
+      [ -n "${is_target[$pid]:-}" ] && continue
+      ppid="${p_ppid[$pid]}"
+      if [ "$d" -eq 1 ] && [ -n "${is_worker[$ppid]:-}" ]; then
+        is_target[$pid]=1
+        p_depth[$pid]=1
+        p_origin[$pid]="tree:${p_comm[$ppid]:-worker}($ppid)"
+        changed=1
+      elif [ "$d" -gt 1 ] && [ -n "${is_target[$ppid]:-}" ] && [ "${p_depth[$ppid]:-0}" -eq $((d - 1)) ]; then
+        is_target[$pid]=1
+        p_depth[$pid]="$d"
+        p_origin[$pid]="${p_origin[$ppid]}->${p_comm[$ppid]}($ppid)"
+        changed=1
+      fi
+    done
+    [ "$changed" -eq 0 ] && break
+  done
+
+  # Schicht 2b: Cgroup-Waisen (Double-Fork / PPID=1 innerhalb einer PHP-FPM-/Webserver-Cgroup)
+  for pid in "${!p_ppid[@]}"; do
+    [ -n "${is_worker[$pid]:-}" ] && continue
+    [ -n "${is_target[$pid]:-}" ] && continue
+    if [ "${p_ppid[$pid]}" -eq 1 ] && [ -r "/proc/$pid/cgroup" ]; then
+      cg=$(awk -F: '{print $NF}' "/proc/$pid/cgroup" 2>/dev/null | head -n 1)
+      if [ -n "$cg" ] && [ -n "${worker_cgroups[$cg]:-}" ]; then
+        is_target[$pid]=1
+        p_depth[$pid]=1
+        cg_unit="${cg##*/}"
+        p_origin[$pid]="cgroup-orphan:${cg_unit}(PPID=1)"
+      fi
+    fi
+  done
+
+  # Schicht 3 & 4: /proc/<pid>-Tiefeninspektion & 3-stufige Risiko-Klassifikation
+  local exe cwd cmdline env_vars fd_target fd_entry has_socket has_pty level
+  local -a reasons=() crit_lines=() warn_lines=() info_lines=()
+  local exe_base cmd_check
+
+  for pid in "${!is_target[@]}"; do
+    [ -d "/proc/$pid" ] || continue
+    reasons=()
+    level="INFO"
+    has_socket=0
+    has_pty=0
+
+    exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+    cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || true)
+    if [ -r "/proc/$pid/cmdline" ]; then
+      cmdline=$(tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null | head -c 260)
+    else
+      cmdline=""
+    fi
+    [ -z "$cmdline" ] && cmdline="${p_args[$pid]:-${p_comm[$pid]:-?}}"
+    exe_base="${exe##*/}"
+    exe_base="${exe_base%% (deleted)*}"
+    [ -z "$exe_base" ] && exe_base="${p_comm[$pid]:-?}"
+    cmd_check="$exe_base $cmdline"
+
+    # Offene File-Deskriptoren auf Sockets (C2/Reverse-Shell/Downloader) und PTYs (interaktive Shell) prüfen
+    if [ -r "/proc/$pid/fd" ]; then
+      for fd_entry in "/proc/$pid/fd"/*; do
+        [ -L "$fd_entry" ] || continue
+        fd_target=$(readlink "$fd_entry" 2>/dev/null || true)
+        case "$fd_target" in
+          socket:\[*) has_socket=1 ;;
+          /dev/pts/*|/dev/ptmx*|/dev/tty*) has_pty=1 ;;
+        esac
+      done
+    fi
+
+    # Whitelist für regulären, kurzlebigen Mail-Versand (PHP mail() -> sendmail/postdrop/msmtp ohne Socket)
+    if [[ "${p_origin[$pid]}" != cgroup-orphan:* ]] && [ "$has_socket" -eq 0 ] && [ "${p_etimes[$pid]:-0}" -lt 30 ]; then
+      if [[ "$exe" =~ ^/usr/(sbin|bin|lib)/(sendmail|postdrop|msmtp|exim4)$ ]] || \
+         [[ "$cmdline" =~ ^(/bin/sh|/usr/bin/sh|/bin/dash)[[:space:]]+-c[[:space:]]+/usr/sbin/sendmail([[:space:]]|$) ]]; then
+        info_lines+=("PID $pid (${p_user[$pid]}) [${p_origin[$pid]}] exe=${exe:-?} cmd='${cmdline}' (Whitelisted Mail-Subprozess)")
+        continue
+      fi
+    fi
+
+    # --- WARN-Kriterien (Stufe 1: Auffälliger Subprozess unter Worker) ---
+    if [[ "$exe_base" =~ ^(sh|dash|bash|zsh|ash|ksh|csh|tcsh|busybox)$ ]]; then
+      level="WARN"; reasons+=("Shell-Subprozess ($exe_base)")
+    fi
+    if [[ "$exe_base" =~ ^(curl|wget|fetch|ftp|sftp|scp|ssh|rsync|aria2c)$ ]] || \
+       [[ "$cmdline" =~ (^|[[:space:]])(curl|wget|scp|ssh|rsync)([[:space:]]|$) ]]; then
+      level="WARN"; reasons+=("Netzwerk-/Transfer-Tool ($exe_base)")
+    fi
+    if [[ "$exe_base" =~ ^(python[0-9.]*|perl|ruby|node|nodejs|php[0-9.]*|lua[0-9.]*|awk|gawk|mawk|nawk|expect|tclsh)$ ]]; then
+      level="WARN"; reasons+=("Script-Interpreter unter Worker ($exe_base)")
+    fi
+    if [[ "$exe_base" =~ ^(id|whoami|uname|hostname|ip|ifconfig|ss|netstat|ps|lsof|find|cat|grep|base64|xxd|od|crontab|chattr|chmod|chown)$ ]]; then
+      level="WARN"; reasons+=("Recon-/System-Befehl ($exe_base)")
+    fi
+    if [ "${p_etimes[$pid]:-0}" -ge 120 ]; then
+      [ "$level" = "INFO" ] && level="WARN"
+      reasons+=("Langläufer (${p_etimes[$pid]}s)")
+    fi
+
+    # --- CRIT-Kriterien (Stufe 2: Hochgradiger Exploit-/Webshell-/RCE-Indikator) ---
+    if [[ "${p_origin[$pid]}" == cgroup-orphan:* ]]; then
+      level="CRIT"; reasons+=("Cgroup-Waise PPID=1 in Worker-Cgroup")
+    fi
+    if [[ "$exe" == *"(deleted)"* ]] || [[ "$exe" =~ ^(/tmp/|/var/tmp/|/dev/shm/|/run/shm/|/memfd:) ]] || \
+       [[ "$cwd" =~ ^(/tmp|/var/tmp|/dev/shm|/run/shm)(/|$) ]]; then
+      level="CRIT"; reasons+=("Fileless/Temp-Pfad (exe=${exe:-?}, cwd=${cwd:-?})")
+    fi
+    if [ -r "/proc/$pid/environ" ]; then
+      env_vars=$(tr '\000' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -E '^LD_(PRELOAD|LIBRARY_PATH)=' | tr '\n' ' ' | head -c 120)
+      if [ -n "$env_vars" ]; then
+        level="CRIT"; reasons+=("Environment-Hijack (${env_vars% })")
+      fi
+    fi
+    if [ "$has_socket" -eq 1 ] && [[ "$exe_base" =~ ^(sh|dash|bash|zsh|ash|ksh|python[0-9.]*|perl|ruby|node|php[0-9.]*|nc|ncat|netcat|socat|openssl|awk|gawk|lua[0-9.]*)$ ]]; then
+      level="CRIT"; reasons+=("Offener Netzwerk-Socket in Shell/Interpreter (Reverse-Shell/C2)")
+    fi
+    if [ "$has_pty" -eq 1 ] && [[ "$exe_base" =~ ^(sh|dash|bash|zsh|python[0-9.]*|perl|ruby|socat|script)$ ]]; then
+      level="CRIT"; reasons+=("Interaktives Pseudo-Terminal (PTY) unter Worker")
+    fi
+    if [[ "$cmd_check" =~ (/dev/tcp/|/dev/udp/|mkfifo|nc[[:space:]]+-e|ncat[[:space:]]+-e|socat[[:space:]].*EXEC:|bash[[:space:]]+-i|sh[[:space:]]+-i|base64[[:space:]]+-d|openssl[[:space:]]+s_client|pty\.spawn|xmrig|minerd|kinsing|kdevtmpfsi|chattr[[:space:]]+\+i) ]] || \
+       [[ "$cmd_check" =~ (curl|wget).*(\|[[:space:]]*(ba|da)?sh) ]]; then
+      level="CRIT"; reasons+=("Exploit-/Reverse-Shell-Signatur in Cmdline")
+    fi
+    if [[ "$cmdline" =~ ^\[.*\] ]] && [ -n "$exe" ]; then
+      level="CRIT"; reasons+=("Prozess-Masquerading (argv[0]='${cmdline%% *}' vs. exe='$exe')")
+    fi
+
+    if [ "$level" = "CRIT" ]; then
+      SUSP_PIDS+=("$pid")
+      crit_lines+=("PID $pid (User=${p_user[$pid]}, Alter=${p_etimes[$pid]}s, Pfad=${p_origin[$pid]}) exe='${exe:-?}' cwd='${cwd:-?}' cmd='${cmdline}' -> [${reasons[*]}]")
+    elif [ "$level" = "WARN" ]; then
+      SUSP_PIDS+=("$pid")
+      warn_lines+=("PID $pid (User=${p_user[$pid]}, Alter=${p_etimes[$pid]}s, Pfad=${p_origin[$pid]}) exe='${exe:-?}' cwd='${cwd:-?}' cmd='${cmdline}' -> [${reasons[*]}]")
+    fi
+  done
+
+  if [ "${#crit_lines[@]}" -gt 0 ]; then
+    susp "Subprozess-Heuristik: ${#crit_lines[@]} KRITISCHE Kind-/Cgroup-Prozesse unter PHP-FPM/Webserver-Workern erkannt!"
+    printf '%s\n' "${crit_lines[@]}" | indent
+  fi
+  if [ "${#warn_lines[@]}" -gt 0 ]; then
+    warn "Subprozess-Heuristik: ${#warn_lines[@]} auffällige Subprozesse (sh/bash/curl/Interpreter) unter PHP-/Web-Workern:"
+    printf '%s\n' "${warn_lines[@]}" | indent
+  fi
+  if [ "${#info_lines[@]}" -gt 0 ]; then
+    info "Subprozess-Heuristik: ${#info_lines[@]} kurzlebige Mail-Subprozesse (Whitelist):"
+    printf '%s\n' "${info_lines[@]}" | indent
+  fi
+  if [ "${#crit_lines[@]}" -eq 0 ] && [ "${#warn_lines[@]}" -eq 0 ]; then
+    ok "Subprozess-Heuristik ($worker_count Worker, ${#worker_cgroups[@]} Service-Cgroups): Keine verdächtigen Kindprozesse (sh/bash/curl/Orphans)"
+  fi
+}
+
 scan_persistence() {
   hdr "5) Persistenz & Prozesse"
   local out wu='www-data|apache|nginx|http|nobody|www|wwwrun'
@@ -942,6 +1145,8 @@ scan_persistence() {
     if [ -n "$out" ]; then warn "Ausgehende Verbindungen von Shells/Downloadern (Reverse-Shell?):"; printf '%s\n' "$out" | indent
     else ok "Keine Shell-/Downloader-Verbindungen aktiv"; fi
   fi
+
+  scan_worker_subprocesses
 }
 
 scan_logs() {
@@ -1349,6 +1554,23 @@ act_evidence() {
   fi
   for f in $(session_dirs); do ls -la "$f" > "$d/sessions-$(basename "$f").txt" 2>/dev/null; done
   if [ "${#FOUND_FILES[@]}" -gt 0 ]; then sha256sum -- "${FOUND_FILES[@]}" > "$d/suspicious-hashes.txt" 2>/dev/null; fi
+  if [ "${#SUSP_PIDS[@]}" -gt 0 ]; then
+    mkdir -p "$d/suspicious-subprocesses" && chmod 700 "$d/suspicious-subprocesses"
+    for pid in "${SUSP_PIDS[@]}"; do
+      [ -d "/proc/$pid" ] || continue
+      tr '\000' ' ' < "/proc/$pid/cmdline" > "$d/suspicious-subprocesses/pid-$pid-cmdline.txt" 2>/dev/null || true
+      tr '\000' '\n' < "/proc/$pid/environ" > "$d/suspicious-subprocesses/pid-$pid-environ.txt" 2>/dev/null || true
+      cp "/proc/$pid/maps" "$d/suspicious-subprocesses/pid-$pid-maps.txt" 2>/dev/null || true
+      cp "/proc/$pid/cgroup" "$d/suspicious-subprocesses/pid-$pid-cgroup.txt" 2>/dev/null || true
+      cp "/proc/$pid/status" "$d/suspicious-subprocesses/pid-$pid-status.txt" 2>/dev/null || true
+      ls -la "/proc/$pid/fd" > "$d/suspicious-subprocesses/pid-$pid-fd.txt" 2>/dev/null || true
+      readlink "/proc/$pid/exe" > "$d/suspicious-subprocesses/pid-$pid-exe-path.txt" 2>/dev/null || true
+      readlink "/proc/$pid/cwd" > "$d/suspicious-subprocesses/pid-$pid-cwd-path.txt" 2>/dev/null || true
+      cp -L "/proc/$pid/exe" "$d/suspicious-subprocesses/pid-$pid-exe.bin" 2>/dev/null || true
+    done
+    chmod 600 "$d/suspicious-subprocesses"/* 2>/dev/null || true
+    info "Forensik-Artefakte für ${#SUSP_PIDS[@]} verdächtige Worker-Subprozesse in $d/suspicious-subprocesses/ gesichert."
+  fi
   if command -v gcore >/dev/null 2>&1; then
     if confirm "Speicherabbild von bis zu 3 PHP-Workern erstellen (enthält Secrets, pausiert Worker kurz)?"; then
       for pid in $(pgrep -f 'php-fpm: pool|apache2|httpd' 2>/dev/null | head -n 3); do gcore -o "$d/gcore" "$pid" >/dev/null 2>&1; done
@@ -3172,18 +3394,46 @@ tg_auditwatch_install() {
   cat > /usr/local/sbin/it-reinbek-auditwatch << 'AW_EOF'
 #!/usr/bin/env bash
 # IT-Reinbek: Überwacht /var/log/audit/audit.log auf php2shell_exec (Shell-/Prozessstarts durch Webserver-User)
-# und meldet Treffer sofort per Telegram-Bot (läuft als root, Token bleibt in 0600 /etc/it-reinbek/telegram.conf).
+# und meldet Treffer sofort per Telegram-Bot inkl. dekodiertem PROCTITLE (läuft als root, Token in 0600 /etc/it-reinbek/telegram.conf).
 set -u
 NOTIFY="__NOTIFY__"
 ALOG="/var/log/audit/audit.log"
 [ -e "$ALOG" ] || touch "$ALOG" 2>/dev/null || true
+
+decode_hex() {
+  local hex="$1" out="" i=0 len=${#1} byte
+  while [ "$i" -lt "$len" ]; do
+    byte="${hex:$i:2}"
+    if [ "$byte" = "00" ]; then
+      out+=" "
+    else
+      out+=$(printf "\\x$byte" 2>/dev/null || true)
+    fi
+    i=$((i + 2))
+  done
+  printf '%s' "$out" | tr -d '\000-\037' | head -c 260
+}
+
+LAST_EXEC_INFO=""
 tail -q -n 0 -F "$ALOG" 2>/dev/null | while IFS= read -r line; do
   case "$line" in
     *'key="php2shell_exec"'*)
       case "$line" in
         *'exe="/usr/sbin/php-fpm'*|*'exe="/usr/bin/php'*) continue ;;
       esac
-      "$NOTIFY" auditd "Verdächtiger Prozessstart durch Webserver-User (php2shell_exec): ${line:0:320}" || true
+      LAST_EXEC_INFO="${line:0:300}"
+      "$NOTIFY" auditd "Verdächtiger Prozessstart durch Webserver-User (php2shell_exec): ${LAST_EXEC_INFO}" || true
+      ;;
+    *'type=PROCTITLE'*'proctitle='*)
+      if [ -n "$LAST_EXEC_INFO" ]; then
+        hex_raw="${line##*proctitle=}"
+        hex_raw="${hex_raw%% *}"
+        if [[ "$hex_raw" =~ ^[0-9A-Fa-f]{4,}$ ]]; then
+          dec_cmd=$(decode_hex "$hex_raw")
+          [ -n "$dec_cmd" ] && "$NOTIFY" auditd "PROCTITLE (dekodierte Cmdline zu php2shell_exec): ${dec_cmd}" || true
+        fi
+        LAST_EXEC_INFO=""
+      fi
       ;;
   esac
 done
@@ -5281,7 +5531,7 @@ tui_befund_screen() {
     text_w=$(( cols - 6 ))
 
     local step_title box_title status_line key_line rec_line
-    local s_php s_dk s_stale s_att s_comp s_mit s_sess s_aud s_clam s_tg
+    local s_php s_dk s_stale s_att s_comp s_subp s_mit s_sess s_aud s_clam s_tg
     if [ "$UI_LANG" = "en" ]; then
       step_title="Step 2/4 - System Audit & Findings "
       box_title="Info"
@@ -5305,6 +5555,7 @@ tui_befund_screen() {
       if [ "$STALE" -gt 0 ]; then s_stale="${Y}${B}RESTART REQUIRED ($STALE process(es))${N}"; else s_stale="${G}${B}Up to date in RAM${N}"; fi
       if [ "$ATT" -gt 0 ]; then s_att="${Y}${B}$ATT indicator(s) found${N}"; else s_att="${G}${B}None (0)${N}"; fi
       if [ "$COMP" -gt 0 ]; then s_comp="${R}${B}$COMP CRITICAL indicator(s)!${N}"; else s_comp="${G}${B}None (0)${N}"; fi
+      if [ "${#SUSP_PIDS[@]}" -gt 0 ]; then s_subp="${R}${B}${#SUSP_PIDS[@]} suspicious PID(s) (${SUSP_PIDS[*]})${N}"; else s_subp="${G}${B}OK (0 suspicious subprocesses/orphans)${N}"; fi
       if [ "$CLAM_MODE_CUR" = "live" ]; then
         s_clam="${G}${B}[x] Active (Real-time clamd+On-Access)${N} | RAM suggestion: ${CLAM_REC} (~${CLAM_EFF_MB} MB free)"
       elif [ "$CLAM_MODE_CUR" = "cron" ]; then
@@ -5340,6 +5591,7 @@ tui_befund_screen() {
       if [ "$STALE" -gt 0 ]; then s_stale="${Y}${B}NEUSTART NOETIG ($STALE Prozess(e))${N}"; else s_stale="${G}${B}Aktuell im RAM${N}"; fi
       if [ "$ATT" -gt 0 ]; then s_att="${Y}${B}$ATT Hinweis(e) gefunden${N}"; else s_att="${G}${B}Keine (0)${N}"; fi
       if [ "$COMP" -gt 0 ]; then s_comp="${R}${B}$COMP KRITISCHE Treffer!${N}"; else s_comp="${G}${B}Keine (0)${N}"; fi
+      if [ "${#SUSP_PIDS[@]}" -gt 0 ]; then s_subp="${R}${B}${#SUSP_PIDS[@]} verdaechtige PID(s) (${SUSP_PIDS[*]})${N}"; else s_subp="${G}${B}OK (0 verdaechtige Subprozesse/Orphans)${N}"; fi
       if [ "$CLAM_MODE_CUR" = "live" ]; then
         s_clam="${G}${B}[x] Aktiv (Echtzeit clamd+On-Access)${N} | RAM-Vorschlag: ${CLAM_REC} (~${CLAM_EFF_MB} MB frei)"
       elif [ "$CLAM_MODE_CUR" = "cron" ]; then
@@ -5392,6 +5644,7 @@ tui_befund_screen() {
       blines+=("    Running Services (RAM)     : $s_stale")
       blines+=("    Attack / Crash Indicators  : $s_att")
       blines+=("    Compromise / Webshells     : $s_comp")
+      blines+=("    Worker Subprocesses (Tree) : $s_subp")
       blines+=("    BSI Workarounds (#7/#8)    : INI Drop-in: $s_mit | Session Storage: $s_sess | Auditd (#13): $s_aud")
       blines+=("    ClamAV Protection (#17)    : $s_clam")
       blines+=("    Telegram Bot Alerts (#18)  : $s_tg")
@@ -5405,6 +5658,7 @@ tui_befund_screen() {
       blines+=("    Laufende Dienste (RAM)     : $s_stale")
       blines+=("    Angriffs-/Segfault-Spuren  : $s_att")
       blines+=("    Kompromittierung/Webshells : $s_comp")
+      blines+=("    Worker-Subprozesse (Baum)  : $s_subp")
       blines+=("    BSI-Workarounds (#7/#8)    : INI-Drop-in: $s_mit | Session-Schutz: $s_sess | Auditd (#13): $s_aud")
       blines+=("    ClamAV Malwareschutz (#17) : $s_clam")
       blines+=("    Telegram-Bot Meldung (#18) : $s_tg")
