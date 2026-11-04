@@ -1,10 +1,22 @@
 #!/usr/bin/env bash
 #
-# php2shell-check.sh  (v1.6.0 - Stateful TUI, Reversible Config & Emergency-Patch Edition)
+# php2shell-check.sh  (v1.6.1 - Stateful TUI, Reversible Config & Emergency-Patch Edition)
 # Prüft PHP auf CVE-2026-109618 (GHSA-w8hw-w9fx-j79w) & CVE-2026-109619 (GHSA-6wmf-4rv5-p3rp) ("PHP2Shell"),
 # berücksichtigt den BSI-IT-Sicherheitshinweis BITS-H Nr. 2026-297981-1132 (Version 1.1 vom 21.10.2026),
 # die Notfall-Updates (8.5.12 / 8.4.27 / 8.3.36 / 8.2.35 + EOL-Backports für 7.4 / 8.0 / 8.1)
 # sowie tagesaktuelle Analysen/IOCs (Armis, Abstract Security, Datadog, Sansec, Corelight, IT-Administrator).
+#
+# Neu in v1.6.1:
+# - Vollständige Docker-/OCI-Container-Integration in der 4-schichtigen Prozessbaum- & Subprozess-Heuristik:
+#     * Erfasst bei laufenden Docker-Containern zusätzlich Container-ID (64-Hex) und Init-Host-PID (State.Pid)
+#       und löst `/proc/<pid>/cgroup` (docker-<id>.scope, /docker/<id>, containerd, kubepods, libpod) automatisch
+#       auf den jeweiligen Container-Namen (`[Container: <name>]`) auf.
+#     * Erkennt Container-Orphans (Double-Fork / Daemonisierung im Container): Im Container-PID-Namespace
+#       wird ein verwaister Prozess an die Container-Init-PID (`DK_INIT_PID[<c>]`, z. B. s6/tini/entrypoint)
+#       oder an `containerd-shim` statt an Host-PID 1 gehängt (`NStgid`/`NSpid`- und Cgroup-Abgleich).
+#     * Führt für alle erkannten PHP-Container (`DK_PHPV[<c>]`) zusätzlich eine In-Container-Heuristik via
+#       `docker top` / `/proc`-Namespace-Mapping durch, sodass auch ungewöhnliche Container-Entrypoints
+#       und isolierte Subprozesse lückenlos geprüft und in Maßnahme #1 forensisch gesichert werden.
 #
 # Neu in v1.6.0:
 # - Vierstufige Prozessbaum- & Subprozess-Heuristik (scan_worker_subprocesses):
@@ -59,7 +71,7 @@
 #
 set -uo pipefail
 
-VERSION="1.6.0"
+VERSION="1.6.1"
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 SINCE="2026-10-17"
 REPORT=""
@@ -114,7 +126,7 @@ DKR_NEWTAGS=""
 PC_ID=""
 PC_VER=""
 HIDDEN_EXCL=(! -name '.php-cs-fixer*.php' ! -name '.php_cs*' ! -name '.phpstorm.meta.php' ! -name '.phpunit*.php' ! -name '.psalm*.php')
-declare -A DK_IMG=() DK_PROJ=() DK_SVC=() DK_DIR=() DK_FILES=() DK_PHPV=() DK_REGHINT=() DK_REGNEWER=() DK_NEWTAGS=()
+declare -A DK_IMG=() DK_PROJ=() DK_SVC=() DK_DIR=() DK_FILES=() DK_PHPV=() DK_REGHINT=() DK_REGNEWER=() DK_NEWTAGS=() DK_ID=() DK_INIT_PID=() DK_ID2NAME=()
 BACKUP_DIR=""
 QUAR_DIR=""
 STATE_DIR="/root/.php2shell-state"
@@ -550,11 +562,19 @@ dk_label() { docker inspect -f "{{index .Config.Labels \"$1\"}}" "$2" 2>/dev/nul
 check_docker() {
   dk_available || return 0
   DK_OK=1
-  local c v img
+  local c v img cid init_pid
   for c in $(docker ps --format '{{.Names}}' 2>/dev/null); do
     DK_ALL+=("$c")
     img=$(dk_inspect '{{.Config.Image}}' "$c")
+    cid=$(dk_inspect '{{.Id}}' "$c")
+    init_pid=$(dk_inspect '{{.State.Pid}}' "$c")
     DK_IMG[$c]="$img"
+    if [ -n "$cid" ]; then
+      DK_ID[$c]="$cid"
+      DK_ID2NAME[$cid]="$c"
+      DK_ID2NAME[${cid:0:12}]="$c"
+    fi
+    [[ "$init_pid" =~ ^[0-9]+$ ]] && [ "$init_pid" -gt 0 ] && DK_INIT_PID[$c]="$init_pid"
     DK_PROJ[$c]=$(dk_label com.docker.compose.project "$c")
     DK_SVC[$c]=$(dk_label com.docker.compose.service "$c")
     DK_DIR[$c]=$(dk_label com.docker.compose.project.working_dir "$c")
@@ -919,11 +939,41 @@ scan_php_internals() {
 
 scan_worker_subprocesses() {
   SUSP_PIDS=()
-  local -A is_worker=() is_target=() p_ppid=() p_user=() p_etimes=() p_comm=() p_args=() p_depth=() p_origin=() worker_cgroups=()
-  local pid ppid user etimes comm args cg cg_unit d changed=1
-  local worker_count=0
+  local -A is_worker=() is_target=() p_ppid=() p_user=() p_etimes=() p_comm=() p_args=() p_depth=() p_origin=() p_cg=() p_cont=() worker_cgroups=() dk_init_pids=()
+  local pid ppid user etimes comm args cg cg_unit cid cname c d changed=1
+  local worker_count=0 dk_worker_containers=0
 
-  # Schicht 1: Laufende PHP-FPM- und Webserver-Master/Worker-PIDs sowie deren systemd-Cgroups dynamisch erfassen
+  # Falls Docker verfügbar ist, aber check_docker noch nicht lief (z. B. Einzelaufruf), Metadaten nachladen
+  if [ "${#DK_ALL[@]}" -eq 0 ] && dk_available; then
+    for c in $(docker ps --format '{{.Names}}' 2>/dev/null); do
+      DK_ALL+=("$c")
+      cid=$(dk_inspect '{{.Id}}' "$c")
+      pid=$(dk_inspect '{{.State.Pid}}' "$c")
+      if [ -n "$cid" ]; then
+        DK_ID[$c]="$cid"
+        DK_ID2NAME[$cid]="$c"
+        DK_ID2NAME[${cid:0:12}]="$c"
+      fi
+      [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 0 ] && DK_INIT_PID[$c]="$pid"
+    done
+  fi
+
+  for c in ${DK_ALL[@]+"${DK_ALL[@]}"}; do
+    pid="${DK_INIT_PID[$c]:-}"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 0 ]; then
+      dk_init_pids[$pid]="$c"
+      if [ -r "/proc/$pid/cgroup" ]; then
+        cg=$(awk -F: '{print $NF}' "/proc/$pid/cgroup" 2>/dev/null | head -n 1)
+        # Wenn Container nachweislich PHP enthält (DK_PHPV) oder die Init-PID selbst ein PHP-/Web-Worker ist, Cgroup registrieren
+        if [ -n "$cg" ] && [ -n "${DK_PHPV[$c]:-}" ]; then
+          worker_cgroups["$cg"]=1
+          dk_worker_containers=$((dk_worker_containers + 1))
+        fi
+      fi
+    fi
+  done
+
+  # Schicht 1: Laufende PHP-FPM- und Webserver-Master/Worker-PIDs (Host + Docker/OCI-Container) sowie deren Cgroups dynamisch erfassen
   while read -r pid ppid user etimes comm args; do
     [[ "$pid" =~ ^[0-9]+$ ]] || continue
     [ "$pid" -eq "$$" ] || [ "$pid" -eq "${BASHPID:-$$}" ] && continue
@@ -933,25 +983,61 @@ scan_worker_subprocesses() {
     p_comm[$pid]="$comm"
     p_args[$pid]="$args"
 
+    if [ -r "/proc/$pid/cgroup" ]; then
+      cg=$(awk -F: '{print $NF}' "/proc/$pid/cgroup" 2>/dev/null | head -n 1)
+      p_cg[$pid]="$cg"
+      if [[ "$cg" =~ (docker[-/]|containerd[-/]|cri-containerd[-/]|libpod-|kubepods.*/pod[^/]+/)([0-9a-f]{12,64}) ]]; then
+        cid="${BASH_REMATCH[2]}"
+        cname="${DK_ID2NAME[$cid]:-${DK_ID2NAME[${cid:0:12}]:-${cid:0:12}}}"
+        p_cont[$pid]="$cname"
+      fi
+    fi
+
     if [[ "$comm" =~ ^(php-fpm.*|php[0-9.]*-fpm|php-cgi.*|lsphp.*|frankenphp|apache2|httpd|nginx|lighttpd|caddy)$ ]] || \
        [[ "$args" =~ ^(php-fpm:[[:space:]]*(pool|master)|nginx:[[:space:]]*(worker|master)|(/usr/(local/)?(s?bin)/)?(php-fpm[0-9.]*|php[0-9.]*-fpm|php-cgi[0-9.]*|lsphp[0-9.]*|frankenphp|apache2|httpd|nginx|lighttpd|caddy)([[:space:]]|$)) ]]; then
       is_worker[$pid]=1
       worker_count=$((worker_count + 1))
-      if [ -r "/proc/$pid/cgroup" ]; then
-        cg=$(awk -F: '{print $NF}' "/proc/$pid/cgroup" 2>/dev/null | head -n 1)
+      cg="${p_cg[$pid]:-}"
+      if [ -n "$cg" ]; then
         if [[ "$cg" =~ \.(service|scope)$ ]] && [[ ! "$cg" =~ (ssh|sshd|user@|session-|getty|cron|systemd-logind) ]]; then
+          worker_cgroups["$cg"]=1
+        elif [[ "$cg" =~ (docker|containerd|kubepods|libpod|lxc) ]]; then
           worker_cgroups["$cg"]=1
         fi
       fi
     fi
   done < <(ps -ww -eo pid=,ppid=,user:32=,etimes=,comm=,args= 2>/dev/null)
 
-  if [ "$worker_count" -eq 0 ]; then
-    info "Subprozess-Heuristik: Keine laufenden PHP-FPM-/Webserver-Worker gefunden."
+  # Auch Container-Init-PIDs und per `docker top` sichtbare Prozesse in erkannten PHP-Containern einbeziehen
+  local dtop_pid
+  for pid in "${!dk_init_pids[@]}"; do
+    c="${dk_init_pids[$pid]}"
+    p_cont[$pid]="$c"
+    if [ -n "${DK_PHPV[$c]:-}" ] && [ -z "${is_worker[$pid]:-}" ]; then
+      # Falls der Container-Entrypoint selbst direkt PHP/Web bedient (z. B. php -S / FrankenPHP / roadrunner)
+      if [[ "${p_comm[$pid]:-}" =~ ^(php.*|frankenphp|lsphp.*|apache2|httpd|nginx|caddy|lighttpd|roadrunner)$ ]]; then
+        is_worker[$pid]=1
+        worker_count=$((worker_count + 1))
+      fi
+    fi
+    # Alle Prozesse dieses Containers via docker top (Host-PIDs) mit dem Container-Namen verknüpfen (falls Cgroup v2 keine Container-ID im Pfad trägt)
+    if [ "$DK_OK" -eq 1 ]; then
+      while read -r dtop_pid; do
+        [[ "$dtop_pid" =~ ^[0-9]+$ ]] || continue
+        p_cont[$dtop_pid]="$c"
+        if [ -n "${DK_PHPV[$c]:-}" ] && [ -n "${p_cg[$dtop_pid]:-}" ]; then
+          worker_cgroups["${p_cg[$dtop_pid]}"]=1
+        fi
+      done < <(docker top "$c" -eo pid= 2>/dev/null || true)
+    fi
+  done
+
+  if [ "$worker_count" -eq 0 ] && [ "$dk_worker_containers" -eq 0 ]; then
+    info "Subprozess-Heuristik: Keine laufenden PHP-FPM-/Webserver-Worker (Host/Container) gefunden."
     return 0
   fi
 
-  # Schicht 2a: Rekursiver Nachfahrenbaum (Tiefe 1..16) unter allen Worker-/Master-PIDs
+  # Schicht 2a: Rekursiver Nachfahrenbaum (Tiefe 1..16) unter allen Worker-/Master-PIDs (Host & Container)
   for (( d=1; d<=16; d++ )); do
     changed=0
     for pid in "${!p_ppid[@]}"; do
@@ -962,34 +1048,47 @@ scan_worker_subprocesses() {
         is_target[$pid]=1
         p_depth[$pid]=1
         p_origin[$pid]="tree:${p_comm[$ppid]:-worker}($ppid)"
+        [ -z "${p_cont[$pid]:-}" ] && [ -n "${p_cont[$ppid]:-}" ] && p_cont[$pid]="${p_cont[$ppid]}"
         changed=1
       elif [ "$d" -gt 1 ] && [ -n "${is_target[$ppid]:-}" ] && [ "${p_depth[$ppid]:-0}" -eq $((d - 1)) ]; then
         is_target[$pid]=1
         p_depth[$pid]="$d"
         p_origin[$pid]="${p_origin[$ppid]}->${p_comm[$ppid]}($ppid)"
+        [ -z "${p_cont[$pid]:-}" ] && [ -n "${p_cont[$ppid]:-}" ] && p_cont[$pid]="${p_cont[$ppid]}"
         changed=1
       fi
     done
     [ "$changed" -eq 0 ] && break
   done
 
-  # Schicht 2b: Cgroup-Waisen (Double-Fork / PPID=1 innerhalb einer PHP-FPM-/Webserver-Cgroup)
+  # Schicht 2b: Cgroup- & Container-Waisen (Double-Fork / PPID=1 auf Host ODER Reparenting an Container-Init/containerd-shim)
   for pid in "${!p_ppid[@]}"; do
     [ -n "${is_worker[$pid]:-}" ] && continue
     [ -n "${is_target[$pid]:-}" ] && continue
-    if [ "${p_ppid[$pid]}" -eq 1 ] && [ -r "/proc/$pid/cgroup" ]; then
-      cg=$(awk -F: '{print $NF}' "/proc/$pid/cgroup" 2>/dev/null | head -n 1)
-      if [ -n "$cg" ] && [ -n "${worker_cgroups[$cg]:-}" ]; then
+    ppid="${p_ppid[$pid]}"
+    cg="${p_cg[$pid]:-}"
+    [ -n "$cg" ] && [ -n "${worker_cgroups[$cg]:-}" ] || continue
+
+    if [ "$ppid" -eq 1 ]; then
+      is_target[$pid]=1
+      p_depth[$pid]=1
+      cg_unit="${cg##*/}"
+      p_origin[$pid]="cgroup-orphan:${cg_unit}(PPID=1)"
+    elif [ -n "${dk_init_pids[$ppid]:-}" ] || [[ "${p_comm[$ppid]:-}" =~ ^(containerd-shim.*|docker-init|tini|dumb-init|s6-svscan|runsvdir)$ ]]; then
+      # Im Container-Namespace werden Double-Fork-Orphans an die Container-PID 1 (dk_init_pids) oder den Shim gehängt.
+      # Reguläre Supervisor-Dienste (cron/rsyslog/nginx/php-fpm) ignorieren wir hier; verdächtige Binaries/Shells werden geprüft.
+      if ! [[ "${p_comm[$pid]:-}" =~ ^(s6-.*|runsv.*|supervisord|cron|crond|rsyslogd|syslog-ng|dbus-daemon|nginx|apache2|httpd|php-fpm.*|lsphp.*|frankenphp|caddy|lighttpd|redis-server|mysqld|mariadbd|postgres)$ ]]; then
         is_target[$pid]=1
         p_depth[$pid]=1
-        cg_unit="${cg##*/}"
-        p_origin[$pid]="cgroup-orphan:${cg_unit}(PPID=1)"
+        cname="${p_cont[$pid]:-${dk_init_pids[$ppid]:-container}}"
+        p_cont[$pid]="$cname"
+        p_origin[$pid]="container-orphan:${cname}(Init-PPID=$ppid/${p_comm[$ppid]:-init})"
       fi
     fi
   done
 
   # Schicht 3 & 4: /proc/<pid>-Tiefeninspektion & 3-stufige Risiko-Klassifikation
-  local exe cwd cmdline env_vars fd_target fd_entry has_socket has_pty level
+  local exe cwd cmdline env_vars fd_target fd_entry has_socket has_pty level cont_tag
   local -a reasons=() crit_lines=() warn_lines=() info_lines=()
   local exe_base cmd_check
 
@@ -999,6 +1098,11 @@ scan_worker_subprocesses() {
     level="INFO"
     has_socket=0
     has_pty=0
+    if [ -n "${p_cont[$pid]:-}" ]; then
+      cont_tag="[Container: ${p_cont[$pid]}] "
+    else
+      cont_tag=""
+    fi
 
     exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
     cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || true)
@@ -1026,10 +1130,10 @@ scan_worker_subprocesses() {
     fi
 
     # Whitelist für regulären, kurzlebigen Mail-Versand (PHP mail() -> sendmail/postdrop/msmtp ohne Socket)
-    if [[ "${p_origin[$pid]}" != cgroup-orphan:* ]] && [ "$has_socket" -eq 0 ] && [ "${p_etimes[$pid]:-0}" -lt 30 ]; then
+    if [[ "${p_origin[$pid]}" != *-orphan:* ]] && [ "$has_socket" -eq 0 ] && [ "${p_etimes[$pid]:-0}" -lt 30 ]; then
       if [[ "$exe" =~ ^/usr/(sbin|bin|lib)/(sendmail|postdrop|msmtp|exim4)$ ]] || \
          [[ "$cmdline" =~ ^(/bin/sh|/usr/bin/sh|/bin/dash)[[:space:]]+-c[[:space:]]+/usr/sbin/sendmail([[:space:]]|$) ]]; then
-        info_lines+=("PID $pid (${p_user[$pid]}) [${p_origin[$pid]}] exe=${exe:-?} cmd='${cmdline}' (Whitelisted Mail-Subprozess)")
+        info_lines+=("${cont_tag}PID $pid (${p_user[$pid]}) [${p_origin[$pid]}] exe=${exe:-?} cmd='${cmdline}' (Whitelisted Mail-Subprozess)")
         continue
       fi
     fi
@@ -1056,6 +1160,11 @@ scan_worker_subprocesses() {
     # --- CRIT-Kriterien (Stufe 2: Hochgradiger Exploit-/Webshell-/RCE-Indikator) ---
     if [[ "${p_origin[$pid]}" == cgroup-orphan:* ]]; then
       level="CRIT"; reasons+=("Cgroup-Waise PPID=1 in Worker-Cgroup")
+    elif [[ "${p_origin[$pid]}" == container-orphan:* ]]; then
+      # Ein Prozess im PHP-Container unter Container-Init, der zusätzlich ein WARN-Kriterium (Shell/Downloader/Interpreter) erfüllt -> CRIT
+      if [ "$level" = "WARN" ]; then
+        level="CRIT"; reasons+=("Container-Waise (Double-Fork an Container-Init)")
+      fi
     fi
     if [[ "$exe" == *"(deleted)"* ]] || [[ "$exe" =~ ^(/tmp/|/var/tmp/|/dev/shm/|/run/shm/|/memfd:) ]] || \
        [[ "$cwd" =~ ^(/tmp|/var/tmp|/dev/shm|/run/shm)(/|$) ]]; then
@@ -1083,19 +1192,19 @@ scan_worker_subprocesses() {
 
     if [ "$level" = "CRIT" ]; then
       SUSP_PIDS+=("$pid")
-      crit_lines+=("PID $pid (User=${p_user[$pid]}, Alter=${p_etimes[$pid]}s, Pfad=${p_origin[$pid]}) exe='${exe:-?}' cwd='${cwd:-?}' cmd='${cmdline}' -> [${reasons[*]}]")
+      crit_lines+=("${cont_tag}PID $pid (User=${p_user[$pid]}, Alter=${p_etimes[$pid]}s, Pfad=${p_origin[$pid]}) exe='${exe:-?}' cwd='${cwd:-?}' cmd='${cmdline}' -> [${reasons[*]}]")
     elif [ "$level" = "WARN" ]; then
       SUSP_PIDS+=("$pid")
-      warn_lines+=("PID $pid (User=${p_user[$pid]}, Alter=${p_etimes[$pid]}s, Pfad=${p_origin[$pid]}) exe='${exe:-?}' cwd='${cwd:-?}' cmd='${cmdline}' -> [${reasons[*]}]")
+      warn_lines+=("${cont_tag}PID $pid (User=${p_user[$pid]}, Alter=${p_etimes[$pid]}s, Pfad=${p_origin[$pid]}) exe='${exe:-?}' cwd='${cwd:-?}' cmd='${cmdline}' -> [${reasons[*]}]")
     fi
   done
 
   if [ "${#crit_lines[@]}" -gt 0 ]; then
-    susp "Subprozess-Heuristik: ${#crit_lines[@]} KRITISCHE Kind-/Cgroup-Prozesse unter PHP-FPM/Webserver-Workern erkannt!"
+    susp "Subprozess-Heuristik: ${#crit_lines[@]} KRITISCHE Kind-/Cgroup-Prozesse unter PHP-FPM/Webserver-Workern (Host/Container) erkannt!"
     printf '%s\n' "${crit_lines[@]}" | indent
   fi
   if [ "${#warn_lines[@]}" -gt 0 ]; then
-    warn "Subprozess-Heuristik: ${#warn_lines[@]} auffällige Subprozesse (sh/bash/curl/Interpreter) unter PHP-/Web-Workern:"
+    warn "Subprozess-Heuristik: ${#warn_lines[@]} auffällige Subprozesse (sh/bash/curl/Interpreter) unter PHP-/Web-Workern (Host/Container):"
     printf '%s\n' "${warn_lines[@]}" | indent
   fi
   if [ "${#info_lines[@]}" -gt 0 ]; then
@@ -1103,7 +1212,7 @@ scan_worker_subprocesses() {
     printf '%s\n' "${info_lines[@]}" | indent
   fi
   if [ "${#crit_lines[@]}" -eq 0 ] && [ "${#warn_lines[@]}" -eq 0 ]; then
-    ok "Subprozess-Heuristik ($worker_count Worker, ${#worker_cgroups[@]} Service-Cgroups): Keine verdächtigen Kindprozesse (sh/bash/curl/Orphans)"
+    ok "Subprozess-Heuristik ($worker_count Worker, ${#worker_cgroups[@]} Service-/Container-Cgroups, $dk_worker_containers PHP-Container): Keine verdächtigen Kindprozesse"
   fi
 }
 
