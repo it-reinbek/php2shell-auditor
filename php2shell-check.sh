@@ -1,10 +1,25 @@
 #!/usr/bin/env bash
 #
-# php2shell-check.sh  (v1.6.1 - Stateful TUI, Reversible Config & Emergency-Patch Edition)
-# Prüft PHP auf CVE-2026-109618 (GHSA-w8hw-w9fx-j79w) & CVE-2026-109619 (GHSA-6wmf-4rv5-p3rp) ("PHP2Shell"),
+# php2shell-check.sh  (v1.7.0 - Stateful TUI, Reversible Config & Emergency-Patch Edition)
+# Prüft PHP auf:
+# - CVE-2026-109618 (GHSA-w8hw-w9fx-j79w) & CVE-2026-109619 (GHSA-6wmf-4rv5-p3rp) ("PHP2Shell")
+# - CVE-2026-126714 ("phpAfterShell" / Direkter Session-Upload-Folgevektor via Torn-Write in session.save_handler=files)
+# - CVE-2026-115560 & CVE-2026-129481 (PHP-Sicherheits-Releases vom 19.11.2026: 8.5.13 / 8.4.28 / 8.3.37 / 8.2.36 / 8.6.0+)
 # berücksichtigt den BSI-IT-Sicherheitshinweis BITS-H Nr. 2026-297981-1132 (Version 1.1 vom 21.10.2026),
-# die Notfall-Updates (8.5.12 / 8.4.27 / 8.3.36 / 8.2.35 + EOL-Backports für 7.4 / 8.0 / 8.1)
+# die Notfall-Updates (8.5.12 / 8.4.27 / 8.3.36 / 8.2.35) sowie die Voll-Patch-Releases vom 19.11.2026
 # sowie tagesaktuelle Analysen/IOCs (Armis, Abstract Security, Datadog, Sansec, Corelight, IT-Administrator).
+#
+# Neu in v1.7.0:
+# - Erkennung & Auditierung von CVE-2026-126714 (phpAfterShell) sowie CVE-2026-115560 & CVE-2026-129481:
+#     * Zweistufige Patch-Baseline:
+#       - Vollständiger Patch-Stand (GRÜN/SAFE): >= 8.5.13, 8.4.28, 8.3.37, 8.2.36, 8.6.0+ bzw. Distro-Backports ab 19.11.2026.
+#       - Oktober-Stand (8.5.12, 8.4.27, 8.3.36, 8.2.35 bzw. Backports 21.10.-18.11.2026): Gegen PHP2Shell gepatcht,
+#         jedoch anfällig für phpAfterShell (CVE-2026-126714) und CVE-2026-129481 -> Bewertung als WARN (bzw. CRIT,
+#         falls session.save_handler=files und session.upload_progress.enabled=1 zeitgleich aktiv sind).
+#     * Detaillierte Prüfung von session.save_handler auf Host und in Containern:
+#       Bei 'files' unter Versionen < .13/.28/.37/.36 Warnung vor Torn-Write-Risiko und Prüfung auf upload_progress=0.
+#     * PHP-FPM Mitigation-Check: Prüft pm.max_requests auf ungepatchtem PHP-FPM und empfiehlt pm.max_requests=1 gegen CVE-2026-129481.
+# - Vollständige Docker-/OCI-Container-Integration in der 4-schichtigen Prozessbaum- & Subprozess-Heuristik (v1.6.1).
 #
 # Neu in v1.6.1:
 # - Vollständige Docker-/OCI-Container-Integration in der 4-schichtigen Prozessbaum- & Subprozess-Heuristik:
@@ -71,7 +86,8 @@
 #
 set -uo pipefail
 
-VERSION="1.6.1"
+VERSION="1.7.0"
+SCRIPT_VERSION="1.7.0"
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 SINCE="2026-10-17"
 REPORT=""
@@ -139,8 +155,11 @@ SNIPPET_DIR="/root/php2shell-snippets"
 
 R_LABEL=(); R_VER=(); R_NEED=(); R_STATE=(); MSGS=()
 
-# Offizielle PHP Notfall-Updates vom 21.10.2026 (16:00 MESZ / 14:00 UTC)
-declare -A FIXED=( [8.5]=8.5.12 [8.4]=8.4.27 [8.3]=8.3.36 [8.2]=8.2.35 )
+# Zweistufige Patch-Baseline:
+# 1) Vollständiger Patch-Stand vom 19.11.2026 (inkl. phpAfterShell CVE-2026-126714, CVE-2026-115560 & CVE-2026-129481):
+declare -A FIXED=( [8.5]=8.5.13 [8.4]=8.4.28 [8.3]=8.3.37 [8.2]=8.2.36 )
+# 2) Notfall-Update-Stand vom 21.10.2026 (gegen PHP2Shell CVE-2026-109618/19 geschützt, aber anfällig für CVE-2026-126714):
+declare -A FIXED_OCTOBER=( [8.5]=8.5.12 [8.4]=8.4.27 [8.3]=8.3.36 [8.2]=8.2.35 )
 # EOL-Branches, für die das PHP Security Team Quellcode-Backports bereitgestellt hat
 declare -A EOL_BACKPORT_BRANCHES=( [8.1]=8.1.34 [8.0]=8.0.30 [7.4]=7.4.33 )
 RECOMMENDED_BRANCH="8.4"
@@ -156,6 +175,10 @@ usage() {
   if [ "${UI_LANG:-de}" = "en" ]; then
     cat <<'EOF'
 Usage: php2shell-check.sh [Options]
+Audits PHP for CVE-2026-109618 & CVE-2026-109619 (PHP2Shell), CVE-2026-126714 (phpAfterShell),
+and CVE-2026-115560 & CVE-2026-129481 (Nov 19, 2026 PHP security releases).
+
+Options:
   --since YYYY-MM-DD     Timestamp from which changes are considered suspicious (Default: 2026-10-17)
   --webroot DIR          Specify webroot explicitly (can be used multiple times; otherwise autodetect)
   --report FILE          Additionally write output to file (without colors)
@@ -168,6 +191,10 @@ EOF
   else
     cat <<'EOF'
 Verwendung: php2shell-check.sh [Optionen]
+Prüft PHP auf CVE-2026-109618 & CVE-2026-109619 (PHP2Shell), CVE-2026-126714 (phpAfterShell)
+sowie CVE-2026-115560 & CVE-2026-129481 (Sicherheits-Releases vom 19.11.2026).
+
+Optionen:
   --since YYYY-MM-DD     Zeitpunkt, ab dem Änderungen verdächtig sind (Standard: 2026-10-17)
   --webroot DIR          Webroot explizit angeben (mehrfach möglich; sonst Autodetect)
   --report DATEI         Ausgabe zusätzlich in Datei schreiben (ohne Farben)
@@ -295,7 +322,7 @@ show_legal_disclaimer() {
       raw_disc=$(cat <<EOF
 ${R}${B}IMPORTANT LEGAL NOTICE & DISCLAIMER OF LIABILITY${N}
 
-This tool (${B}IT-Reinbek PHP2Shell-Auditor v${VERSION}${N}) is designed for security auditing and assisted containment/remediation of ${B}CVE-2026-109618${N} and ${B}CVE-2026-109619 ("PHP2Shell")${N}.
+This tool (${B}IT-Reinbek PHP2Shell-Auditor v${VERSION}${N}) is designed for security auditing and assisted containment/remediation of ${B}CVE-2026-109618${N} and ${B}CVE-2026-109619 ("PHP2Shell")${N}, ${B}CVE-2026-126714 ("phpAfterShell")${N}, and the ${B}Nov 19, 2026 security fixes (CVE-2026-115560 & CVE-2026-129481)${N}.
 
 ${C}${B}1. Provided "AS IS" & Sole Responsibility${N}
 This script is provided free of charge and used at the sole risk and full responsibility of the user/operator. No warranty of any kind is given regarding accuracy, completeness, timeliness, absence of errors, or fitness for purpose.
@@ -321,7 +348,7 @@ EOF
       raw_disc=$(cat <<EOF
 ${R}${B}WICHTIGER RECHTLICHER HINWEIS & HAFTUNGSAUSSCHLUSS (DISCLAIMER)${N}
 
-Dieses Werkzeug (${B}IT-Reinbek PHP2Shell-Auditor v${VERSION}${N}) dient der Sicherheitsanalyse sowie der unterstuetzten Eindaemmung und Behebung der Schwachstellen ${B}CVE-2026-109618${N} und ${B}CVE-2026-109619 ("PHP2Shell")${N}.
+Dieses Werkzeug (${B}IT-Reinbek PHP2Shell-Auditor v${VERSION}${N}) dient der Sicherheitsanalyse sowie der unterstuetzten Eindaemmung und Behebung der Schwachstellen ${B}CVE-2026-109618${N} und ${B}CVE-2026-109619 ("PHP2Shell")${N}, ${B}CVE-2026-126714 ("phpAfterShell")${N} sowie den ${B}Sicherheits-Releases vom 19.11.2026 (CVE-2026-115560 & CVE-2026-129481)${N}.
 
 ${C}${B}1. Bereitstellung ohne Gewaehr ("AS IS") & Eigenverantwortung${N}
 Die Bereitstellung und Nutzung dieses Skripts erfolgt unentgeltlich und auf alleinige Gefahr sowie in voller Eigenverantwortung des Anwenders/Betreibers. Es wird keinerlei Gewaehrleistung fuer Richtigkeit, Vollstaendigkeit, Aktualitaet, Fehlerfreiheit oder die Eignung fuer einen bestimmten Zweck uebernommen.
@@ -438,31 +465,42 @@ distro_path() {
   return 1
 }
 
-backport_fix_present() { # Prüft Distro-/LTS-Backports (insb. für 7.4, 8.0, 8.1 sowie Enterprise-Linux)
-  local f="$1" pkg="" cl bdate pver
+backport_level() { # Ermittelt Backport-Level: 2 = Nov-Release (>= 19.11.2026), 1 = Okt-Release (21.10.-18.11.2026), 0 = kein Backport
+  local f="$1" pkg="" cl bdate pver ymd
   if command -v dpkg >/dev/null 2>&1; then
     pkg=$(dpkg -S "$f" 2>/dev/null | head -n1 | cut -d: -f1)
     if [ -n "$pkg" ]; then
       for cl in /usr/share/doc/"$pkg"/changelog*.gz; do
-        if [ -f "$cl" ] && zgrep -qE 'CVE-2026-10961[89]|GHSA-w8hw-w9fx-j79w|GHSA-6wmf-4rv5-p3rp' "$cl" 2>/dev/null; then return 0; fi
+        if [ -f "$cl" ]; then
+          if zgrep -qE 'CVE-2026-126714|CVE-2026-115560|CVE-2026-129481|phpAfterShell' "$cl" 2>/dev/null; then echo 2; return 0; fi
+          if zgrep -qE 'CVE-2026-10961[89]|GHSA-w8hw-w9fx-j79w|GHSA-6wmf-4rv5-p3rp' "$cl" 2>/dev/null; then echo 1; return 0; fi
+        fi
       done
-      # Sury/Ondrej PPA & Debian LTS kennzeichnen Backports oft im Paket-Versionsstring mit Datum >= 20261021
       pver=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true)
-      if [[ "$pver" =~ 2026(102[1-9]|103[01]|1[12][0-9]{2}) ]]; then return 0; fi
+      if [[ "$pver" =~ 2026(1119|11[2-9][0-9]|12[0-9]{2}) ]]; then echo 2; return 0; fi
+      if [[ "$pver" =~ 2026(102[1-9]|103[01]|110[1-9]|111[0-8]) ]]; then echo 1; return 0; fi
     fi
   fi
   if command -v rpm >/dev/null 2>&1; then
     pkg=$(rpm -qf "$f" 2>/dev/null | head -n1)
-    if [ -n "$pkg" ] && rpm -q --changelog "$pkg" 2>/dev/null | grep -qE 'CVE-2026-10961[89]|GHSA-w8hw-w9fx-j79w|GHSA-6wmf-4rv5-p3rp'; then return 0; fi
-  fi
-  # Build-Datum im PHP-Binary prüfen (Plesk, CloudLinux, Remi, Sury Backports für 7.4/8.0/8.1 gebaut ab 21.10.2026)
-  if [ -x "$f" ]; then
-    bdate=$("$f" -v 2>/dev/null | head -n1 | sed -n 's/.*(built: \([^)]*\)).*/\1/p')
-    if [ -n "$bdate" ] && [ "$(date -d "$bdate" +%Y%m%d 2>/dev/null || echo 0)" -ge 20261021 ] 2>/dev/null; then
-      return 0
+    if [ -n "$pkg" ]; then
+      if rpm -q --changelog "$pkg" 2>/dev/null | grep -qE 'CVE-2026-126714|CVE-2026-115560|CVE-2026-129481|phpAfterShell'; then echo 2; return 0; fi
+      if rpm -q --changelog "$pkg" 2>/dev/null | grep -qE 'CVE-2026-10961[89]|GHSA-w8hw-w9fx-j79w|GHSA-6wmf-4rv5-p3rp'; then echo 1; return 0; fi
     fi
   fi
-  return 1
+  if [ -x "$f" ]; then
+    bdate=$("$f" -v 2>/dev/null | head -n1 | sed -n 's/.*(built: \([^)]*\)).*/\1/p')
+    ymd=$(date -d "$bdate" +%Y%m%d 2>/dev/null || echo 0)
+    if [ "$ymd" -ge 20261119 ] 2>/dev/null; then echo 2; return 0; fi
+    if [ "$ymd" -ge 20261021 ] 2>/dev/null; then echo 1; return 0; fi
+  fi
+  echo 0
+}
+
+backport_fix_present() {
+  local lvl
+  lvl=$(backport_level "$1")
+  [ "$lvl" -ge 1 ]
 }
 
 get_pkg_version() {
@@ -481,7 +519,7 @@ add_row() {
 }
 
 assess() {
-  local label="$1" ver="$2" path="$3" branch fixed bp=1
+  local label="$1" ver="$2" path="$3" branch fixed_nov fixed_oct bp_lvl=0
   LAST_STATE=UNKNOWN
   if ! [[ "$ver" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
     add_row "$label" "$ver" "?" UNKNOWN
@@ -490,23 +528,34 @@ assess() {
   fi
   branch="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
   ver="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
-  fixed="${FIXED[$branch]:-}"
-  if distro_path "$path" && backport_fix_present "$path"; then bp=0; fi
+  fixed_nov="${FIXED[$branch]:-}"
+  fixed_oct="${FIXED_OCTOBER[$branch]:-}"
+  if distro_path "$path"; then bp_lvl=$(backport_level "$path"); fi
 
-  if [ -n "$fixed" ] && ver_ge "$ver" "$fixed"; then
-    add_row "$label" "$ver" ">= $fixed" SAFE; LAST_STATE=SAFE
+  # 1) Voll-Patch (>= 8.6.0, >= 8.5.13 / 8.4.28 / 8.3.37 / 8.2.36 oder Backport >= 19.11.2026)
+  if ver_ge "$ver" "8.6.0"; then
+    add_row "$label" "$ver" ">= 8.6.0" SAFE; LAST_STATE=SAFE
+  elif [ -n "$fixed_nov" ] && ver_ge "$ver" "$fixed_nov"; then
+    add_row "$label" "$ver" ">= $fixed_nov" SAFE; LAST_STATE=SAFE
     if [ "$branch" = "8.2" ]; then
       MSGS+=("info|$label: Notfall-Update ($ver) ist installiert, ABER Branch 8.2 erreicht am 31.12.2026 EOL (BSI-Empfehlung: Migration auf >= 8.4 planen)")
     fi
-  elif [ "$bp" -eq 0 ]; then
-    add_row "$label" "$ver" "(Backport >=21.10.)" BACKPORT; LAST_STATE=BACKPORT
-  elif [ -n "$fixed" ]; then
-    add_row "$label" "$ver" ">= $fixed" VULN; LAST_STATE=VULN
-    MSGS+=("crit|$label: PHP $ver ist VERWUNDBAR -> Notfall-Update auf mindestens $fixed nötig!")
+  elif [ "$bp_lvl" -eq 2 ]; then
+    add_row "$label" "$ver" "(Backport >=19.11.)" BACKPORT; LAST_STATE=BACKPORT
+
+  # 2) Oktober-Stand (8.5.12, 8.4.27, 8.3.36, 8.2.35 oder Backport 21.10.-18.11.2026):
+  # Gegen PHP2Shell gepatcht, jedoch anfällig für phpAfterShell (CVE-2026-126714) und CVE-2026-129481
+  elif { [ -n "$fixed_oct" ] && ver_ge "$ver" "$fixed_oct"; } || [ "$bp_lvl" -eq 1 ]; then
+    add_row "$label" "$ver" ">= ${fixed_nov:-8.4.28}" OCT_FIX; LAST_STATE=OCT_FIX
+    MSGS+=("warn|$label: PHP $ver ist gegen PHP2Shell (CVE-2026-109618/19) geschützt, ABER ANFÄLLIG für phpAfterShell (CVE-2026-126714) und CVE-2026-129481 -> Update auf mindestens ${fixed_nov:-8.4.28} dringend empfohlen!")
+
+  # 3) Ungepatchter aktiver Branch (< Oktober-Stand)
+  elif [ -n "$fixed_nov" ]; then
+    add_row "$label" "$ver" ">= $fixed_nov" VULN; LAST_STATE=VULN
+    MSGS+=("crit|$label: PHP $ver ist VOLLSTÄNDIG VERWUNDBAR (PHP2Shell & phpAfterShell) -> Update auf mindestens $fixed_nov nötig!")
     [ "$path" = "/container" ] || NEED_UPDATE+=("$branch")
-  elif ver_ge "$ver" "8.6.0"; then
-    add_row "$label" "$ver" "?" UNKNOWN
-    MSGS+=("info|$label: PHP $ver - neuer als die bekannten Branches, Fix-Stand bitte selbst prüfen")
+
+  # 4) EOL-Branches (< 8.2) ohne Backport
   else
     add_row "$label" "$ver" "Backport / >= ${RECOMMENDED_BRANCH}.x" EOL; LAST_STATE=EOL
     if [ -n "${EOL_BACKPORT_BRANCHES[$branch]:-}" ]; then
@@ -524,9 +573,10 @@ print_table() {
   printf '%s%-46s %-10s %-18s %s%s\n' "$B" "INSTALLATION" "VERSION" "SICHER AB" "STATUS" "$N"
   for i in "${!R_LABEL[@]}"; do
     case "${R_STATE[$i]}" in
-      SAFE)     c="$G"; st="SICHER (Notfall-Update aktiv)" ;;
-      BACKPORT) c="$G"; st="SICHER (Distro/LTS-Backport)" ;;
-      VULN)     c="$R"; st="UNSICHER - Notfall-Update nötig" ;;
+      SAFE)     c="$G"; st="SICHER (Voll-Patch 19.11. aktiv)" ;;
+      BACKPORT) c="$G"; st="SICHER (Distro/LTS-Backport >=19.11.)" ;;
+      OCT_FIX)  c="$Y"; st="WARNUNG (PHP2Shell gefixt, phpAfterShell offen!)" ;;
+      VULN)     c="$R"; st="UNSICHER - Voll-Patch dringend nötig" ;;
       EOL)      c="$R"; st="UNSICHER - EOL (Backport/Upgrade nötig)" ;;
       *)        c="$Y"; st="UNKLAR - manuell prüfen" ;;
     esac
@@ -583,7 +633,7 @@ check_docker() {
     if [ -n "$v" ]; then
       DK_PHPV[$c]="$v"
       assess "Container $c ($img)" "$v" "/container"
-      if [ "$LAST_STATE" = "VULN" ] || [ "$LAST_STATE" = "EOL" ]; then DK_VULN+=("$c"); fi
+      if [ "$LAST_STATE" = "VULN" ] || [ "$LAST_STATE" = "EOL" ] || [ "$LAST_STATE" = "OCT_FIX" ]; then DK_VULN+=("$c"); fi
     fi
   done
 }
@@ -633,11 +683,15 @@ repo_candidate() {
   if [[ "$cand" =~ ^([0-9]+:)?([0-9]+\.[0-9]+\.[0-9]+) ]]; then
     up="${BASH_REMATCH[2]}"
     if [ -n "${FIXED[$1]:-}" ] && ver_ge "$up" "${FIXED[$1]}"; then
-      info "Repo-Kandidat für $1: $cand -> enthält das Notfall-Update (${FIXED[$1]})"
-    elif [[ "$cand" =~ 2026(102[1-9]|103[01]|1[12][0-9]{2}) ]]; then
-      info "Repo-Kandidat für $1: $cand -> enthält den Distro/Sury-Backport (>= 21.10.2026)"
+      info "Repo-Kandidat für $1: $cand -> enthält das Voll-Patch-Release (${FIXED[$1]})"
+    elif [[ "$cand" =~ 2026(1119|11[2-9][0-9]|12[0-9]{2}) ]]; then
+      info "Repo-Kandidat für $1: $cand -> enthält den Distro/Sury-Backport (>= 19.11.2026)"
+    elif [ -n "${FIXED_OCTOBER[$1]:-}" ] && ver_ge "$up" "${FIXED_OCTOBER[$1]}"; then
+      info "Repo-Kandidat für $1: $cand -> enthält Notfall-Update (${FIXED_OCTOBER[$1]}, Achtung: phpAfterShell offen)"
+    elif [[ "$cand" =~ 2026(102[1-9]|103[01]|110[1-9]|111[0-8]) ]]; then
+      info "Repo-Kandidat für $1: $cand -> enthält den Oktober-Backport (>= 21.10.2026, Achtung: phpAfterShell offen)"
     else
-      info "Repo-Kandidat für $1: $cand -> evtl. Distro-Backport (prüfen: apt changelog php$1-cli | grep -E 'CVE-2026-10961[89]')"
+      info "Repo-Kandidat für $1: $cand -> evtl. Distro-Backport (prüfen: apt changelog php$1-cli | grep -E 'CVE-2026-10961[89]|CVE-2026-126714')"
     fi
   fi
 }
@@ -649,7 +703,7 @@ uniq_branches() {
 
 suggest_install() {
   [ "${#NEED_UPDATE[@]}" -gt 0 ] || return 0
-  hdr "Update-Ziele (Notfall-Updates vom 21.10.2026)"
+  hdr "Update-Ziele (Sicherheits-Releases vom 19.11.2026 / Notfall-Updates)"
   local id like branch tgt
   id=$(. /etc/os-release 2>/dev/null; echo "${ID:-unknown}")
   like=$(. /etc/os-release 2>/dev/null; echo "${ID_LIKE:-}")
@@ -668,7 +722,7 @@ suggest_install() {
 
 check_runtime() {
   hdr "2) Laufende Prozesse, Systemhärtung & BSI-Mitigationen"
-  local pid exe php up ml pms umf feb expose rlim
+  local pid exe php up ml pms umf feb expose rlim shandler
   for pid in $(pgrep -f 'php-fpm: master|apache2 -k|httpd|frankenphp|lshttpd|lsphp' 2>/dev/null); do
     exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
     if [[ "$exe" == *"(deleted)"* ]] || grep -qE 'libphp.*\(deleted\)' "/proc/$pid/maps" 2>/dev/null; then
@@ -686,7 +740,8 @@ check_runtime() {
 
   php=$(command -v php || true)
   if [ -n "$php" ]; then
-    local php_branch de_err strict_mode
+    local php_branch php_fullver de_err strict_mode
+    php_fullver=$("$php" -r 'echo PHP_VERSION;' 2>/dev/null || true)
     php_branch=$("$php" -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true)
     up=$("$php" -r 'echo ini_get("session.upload_progress.enabled");' 2>/dev/null)
     ml=$("$php" -r 'echo ini_get("memory_limit");' 2>/dev/null)
@@ -696,9 +751,35 @@ check_runtime() {
     expose=$("$php" -r 'echo ini_get("expose_php");' 2>/dev/null)
     de_err=$("$php" -r 'echo ini_get("display_errors");' 2>/dev/null)
     strict_mode=$("$php" -r 'echo ini_get("session.use_strict_mode");' 2>/dev/null)
-    info "CLI-Konfig: upload_progress=${up:-0}, memory_limit=${ml:-?}, post_max_size=${pms:-?}, upload_max_filesize=${umf:-?}, fatal_error_backtraces=${feb:-n/a}, expose_php=${expose:-0}, display_errors=${de_err:-0}, use_strict_mode=${strict_mode:-0} (FPM/Apache können abweichen!)"
+    shandler=$("$php" -r 'echo ini_get("session.save_handler");' 2>/dev/null)
+    info "CLI-Konfig: save_handler=${shandler:-files}, upload_progress=${up:-0}, memory_limit=${ml:-?}, post_max_size=${pms:-?}, upload_max_filesize=${umf:-?}, fatal_error_backtraces=${feb:-n/a}, expose_php=${expose:-0}, display_errors=${de_err:-0}, use_strict_mode=${strict_mode:-0} (FPM/Apache können abweichen!)"
+
+    # phpAfterShell (CVE-2026-126714) Prüfung: session.save_handler=files auf Versionen < Voll-Patch
+    local is_full_patched=0 bp_cur=0
+    if [ -n "$php_fullver" ]; then
+      if ver_ge "$php_fullver" "8.6.0"; then
+        is_full_patched=1
+      elif [ -n "${FIXED[$php_branch]:-}" ] && ver_ge "$php_fullver" "${FIXED[$php_branch]}"; then
+        is_full_patched=1
+      fi
+    fi
+    if distro_path "$php"; then
+      bp_cur=$(backport_level "$php")
+      [ "$bp_cur" -eq 2 ] && is_full_patched=1
+    fi
+
+    if [ "$is_full_patched" -eq 0 ]; then
+      if [ "${shandler:-files}" = "files" ]; then
+        if [ "${up:-0}" = "1" ]; then
+          crit "KRITISCH (CVE-2026-126714 - phpAfterShell): session.save_handler=files UND session.upload_progress.enabled=1 auf ungepatchtem PHP ($php_fullver) aktiv! Direkter Session-Upload-Folgevektor via Torn-Write möglich (upload_progress SOFORT auf 0 setzen!)."
+        else
+          warn "WARNUNG (CVE-2026-126714 - phpAfterShell): session.save_handler=files auf PHP $php_fullver (< ${FIXED[$php_branch]:-8.4.28}) aktiv. Torn-Write-Risiko in Session-Dateien vorhanden. Sicherstellen, dass session.upload_progress.enabled=0 bleibt und zeitnah Voll-Patch einspielen."
+        fi
+      fi
+    fi
+
     if [ "${up:-0}" = "1" ]; then
-      warn "session.upload_progress.enabled=1 ist aktiv: Ermöglicht das Manipulieren von Session-Daten ohne Upload-Skript und dient als primärer Angriffsvektor für CVE-2026-109619 (BSI/CERT-EU-Empfehlung: auf 0 setzen)."
+      warn "session.upload_progress.enabled=1 ist aktiv: Ermöglicht das Manipulieren von Session-Daten ohne Upload-Skript und dient als primärer Angriffsvektor für CVE-2026-109619 & CVE-2026-126714 (BSI/CERT-EU-Empfehlung: auf 0 setzen)."
     fi
     if [ "${ml:-}" = "-1" ]; then
       warn "memory_limit=-1 aktiv: Dies ist ein temporärer Notfall-Workaround (DoS-Risiko!), der nach dem Patch zwingend wieder auf ein reguläres Limit (z. B. 256M) zurückgesetzt werden muss."
@@ -727,6 +808,20 @@ check_runtime() {
   if [ -n "$mem_unlim_files" ] && [ "${ml:-}" != "-1" ]; then
     warn "memory_limit=-1 in FPM/Webserver-Konfiguration gefunden ($mem_unlim_files): Dies ist ein temporärer Notfall-Workaround, der nach dem Patch wieder auf ein reguläres Limit (z. B. 256M) zurückgesetzt werden muss."
   fi
+
+  # PHP-FPM pm.max_requests Check gegen CVE-2026-129481 auf ungepatchtem PHP-FPM
+  local fpm_unpatched=0 fpm_pool pf pm_mr
+  for fpm_pool in $(pool_files); do
+    [ -f "$fpm_pool" ] || continue
+    # Ermitteln, ob zugehöriger FPM-Branch ungepatcht ist
+    fpm_unpatched=1
+    pm_mr=$(grep -E '^[[:space:]]*pm\.max_requests[[:space:]]*=' "$fpm_pool" 2>/dev/null | tail -n1 | awk -F= '{print $2}' | tr -d ' ' || true)
+    if [ -n "$pm_mr" ] && [ "$pm_mr" != "1" ]; then
+      info "FPM-Pool $fpm_pool hat pm.max_requests=${pm_mr}: Auf ungepatchtem PHP-FPM (< ${FIXED[8.4]}) wird pm.max_requests=1 als Mitigation gegen CVE-2026-129481 (Worker-State-Poisoning) empfohlen."
+    elif [ -z "$pm_mr" ]; then
+      info "FPM-Pool $fpm_pool: pm.max_requests ist nicht gesetzt (Standard 0 = unendlich). Auf ungepatchtem PHP-FPM wird pm.max_requests=1 empfohlen (Mitigation gegen CVE-2026-129481)."
+    fi
+  done
 
   local b start_warn b_branch b_feb
   for b in $(find_php_binaries); do
@@ -1496,6 +1591,28 @@ dk_scan_container() {
   else ok "Container $c: keine Exploit-Signatur ('in Unknown on line 0') in den Logs"; fi
   out=$(docker logs --since "$since" "$c" 2>&1 | grep -Eic 'segfault|signal 11|exited on signal|Allowed memory size|Maximum execution time|zend_mm_heap corrupted')
   if [ "${out:-0}" -gt 0 ] 2>/dev/null; then warn "Container $c: $out Log-Zeilen mit Segfault/Signal/Memory-Limit/Timeout seit $SINCE (Zeitstempel prüfen)"; ATT=$((ATT+1)); fi
+
+  # session.save_handler & upload_progress Prüfung im Container (CVE-2026-126714 - phpAfterShell)
+  local c_shandler c_up c_phpv c_branch c_is_patched=0
+  c_phpv="${DK_PHPV[$c]:-}"
+  c_branch="${c_phpv%.*}"
+  if [ -n "$c_phpv" ]; then
+    if ver_ge "$c_phpv" "8.6.0"; then c_is_patched=1
+    elif [ -n "${FIXED[$c_branch]:-}" ] && ver_ge "$c_phpv" "${FIXED[$c_branch]}"; then c_is_patched=1; fi
+  fi
+  c_shandler=$(docker exec "$c" sh -c 'php -r "echo ini_get(\"session.save_handler\");" 2>/dev/null || php-fpm -i 2>/dev/null | awk -F"=> " "/session.save_handler/{print \$2; exit}"' 2>/dev/null || true)
+  c_up=$(docker exec "$c" sh -c 'php -r "echo ini_get(\"session.upload_progress.enabled\");" 2>/dev/null || php-fpm -i 2>/dev/null | awk -F"=> " "/session.upload_progress.enabled/{print \$2; exit}"' 2>/dev/null || true)
+  c_shandler="${c_shandler:-files}"
+  c_up="${c_up:-0}"
+  if [ "$c_is_patched" -eq 0 ]; then
+    if [ "$c_shandler" = "files" ]; then
+      if [ "$c_up" = "1" ]; then
+        crit "Container $c: KRITISCH (CVE-2026-126714 - phpAfterShell): session.save_handler=files UND session.upload_progress.enabled=1 auf ungepatchtem PHP ($c_phpv) aktiv! Direkter Session-Upload-Folgevektor via Torn-Write möglich (upload_progress SOFORT auf 0 setzen!)."
+      else
+        warn "Container $c: session.save_handler=files auf PHP $c_phpv (< ${FIXED[$c_branch]:-8.4.28}) aktiv -> Torn-Write-Risiko (CVE-2026-126714 - phpAfterShell). Sicherstellen, dass upload_progress=0 bleibt und Image auf Version >= ${FIXED[$c_branch]:-8.4.28} aktualisieren."
+      fi
+    fi
+  fi
 }
 
 dk_scan_weblog() {
@@ -4398,10 +4515,10 @@ load_menu_texts() {
     M_IMPACT[2]="Zero impact on operations. Also executed automatically before any modifying action."
     M_UNDO[2]="Uncheck [x] -> [ ] and press [Enter]: Offers restoring configs.tar.gz to / or deleting the backup."
 
-    M_CAT[3]="II. Patching & Upgrades"; M_TITLE[3]="PHP emergency updates (same branch)"
+    M_CAT[3]="II. Patching & Upgrades"; M_TITLE[3]="PHP updates (same branch)"
     M_RISK[3]="MEDIUM (with pre-flight dry-run & automatic rollback)"
-    M_WHAT[3]="Installs the official PHP emergency updates (8.2.35, 8.3.36, 8.4.27, 8.5.12 and distro/LTS backports for 7.4, 8.0, 8.1). Backs up old .deb packages beforehand and verifies services, ports, and HTTP responses afterwards."
-    M_IMPACT[3]="PHP-FPM/Apache restart briefly during package update (1-3 sec interruption). If already patched, the checkbox is green [x]."
+    M_WHAT[3]="Installs the official PHP security releases (8.2.36, 8.3.37, 8.4.28, 8.5.13 and distro/LTS backports >= 19.11.2026 for PHP2Shell, phpAfterShell & CVE-2026-129481). Backs up old .deb packages beforehand and verifies services, ports, and HTTP responses afterwards."
+    M_IMPACT[3]="PHP-FPM/Apache restart briefly during package update (1-3 sec interruption). If already fully patched, the checkbox is green [x]."
     M_UNDO[3]="Uncheck [x] -> [ ] and press [Enter]: Reinstalls the previously backed-up .deb packages (downgrade)."
 
     M_CAT[4]="II. Patching & Upgrades"; M_TITLE[4]="EOL-PHP Stage 1: Parallel install"
@@ -4424,7 +4541,7 @@ load_menu_texts() {
 
     M_CAT[7]="III. BSI Workarounds"; M_TITLE[7]="BSI drop-in (upload_progress/post_max)"
     M_RISK[7]="LOW-MEDIUM (temporary workaround per BSI v1.1)"
-    M_WHAT[7]="Creates 99-php2shell-mitigation.ini: sets session.upload_progress.enabled=0 and fatal_error_backtraces=0 (against CVE-2026-109619), limits post_max_size to 8M or 32M (against CVE-2026-109618), and sets expose_php=0."
+    M_WHAT[7]="Creates 99-php2shell-mitigation.ini: sets session.upload_progress.enabled=0 and fatal_error_backtraces=0 (against CVE-2026-109619 & phpAfterShell CVE-2026-126714), limits post_max_size to 8M or 32M (against CVE-2026-109618), sets session.use_strict_mode=1, and sets expose_php=0."
     M_IMPACT[7]="Session upload progress bars are disabled; oversized POST requests are rejected. Marked [x] when file is present."
     M_UNDO[7]="Uncheck [x] -> [ ] and press [Enter]: Removes 99-php2shell-mitigation.ini from all conf.d folders and offers service restart."
 
@@ -4506,9 +4623,9 @@ load_menu_texts() {
     M_IMPACT[2]="Keine Auswirkung auf den Betrieb. Wird vor jeder ändernden Maßnahme auch automatisch ausgeführt."
     M_UNDO[2]="Haken [x] -> [ ] abwählen und [Enter] drücken: Bietet das Zurückspielen (Restore) von configs.tar.gz nach / oder das Löschen des Backups an."
 
-    M_CAT[3]="II. Patchen & Upgrades"; M_TITLE[3]="PHP-Notfall-Updates (gleicher Branch)"
+    M_CAT[3]="II. Patchen & Upgrades"; M_TITLE[3]="PHP-Sicherheits-Updates (gleicher Branch)"
     M_RISK[3]="MITTEL (mit Vorab-Dry-Run & automatischem Rollback)"
-    M_WHAT[3]="Installiert die offiziellen PHP-Notfall-Updates (8.2.35, 8.3.36, 8.4.27, 8.5.12 sowie Distro-/LTS-Backports für 7.4, 8.0 und 8.1). Sichert vorher die alten .deb-Pakete und prüft nachher Dienste, Ports und HTTP-Antworten."
+    M_WHAT[3]="Installiert die offiziellen PHP-Sicherheits-Updates (8.2.36, 8.3.37, 8.4.28, 8.5.13 sowie Distro-/LTS-Backports ab 19.11.2026 für PHP2Shell, phpAfterShell & CVE-2026-129481). Sichert vorher die alten .deb-Pakete und prüft nachher Dienste, Ports und HTTP-Antworten."
     M_IMPACT[3]="PHP-FPM/Apache werden beim Paketupdate kurz neu gestartet (1-3 Sek. Unterbrechung). Ist bereits alles sicher gepatcht, steht die Checkbox grün auf [x]."
     M_UNDO[3]="Haken [x] -> [ ] abwählen und [Enter] drücken: Spielt die vor dem Update gesicherten .deb-Pakete wieder ein (Downgrade)."
 
@@ -4527,12 +4644,12 @@ load_menu_texts() {
     M_CAT[6]="II. Patchen & Upgrades"; M_TITLE[6]="Docker: compose down, Backup & Update"
     M_RISK[6]="MITTEL-HOCH (stoppt Stack sauber für konsistentes Backup)"
     M_WHAT[6]="Prüft für verwundbare PHP-Container, ob ein gepatchtes Image vorliegt. Erstellt zuerst einen Online-DB-Dump, fährt das Projekt dann mit 'docker compose down' sauber herunter (löst alle Datei-/DB-Locks!), sichert alle Bind-Mounts/Volumes und startet mit 'docker compose up -d' neu."
-    M_IMPACT[6]="Kurze Downtime des Compose-Projekts während des Backups und Neustarts. Sind alle Container bereits sicher (wie dein InvoiceNinja mit PHP 8.5.12), steht die Checkbox grün auf [x]."
+    M_IMPACT[6]="Kurze Downtime des Compose-Projekts während des Backups und Neustarts. Sind alle Container bereits sicher (auf Voll-Patch >= 8.5.13/8.4.28/8.3.37/8.2.36), steht die Checkbox grün auf [x]."
     M_UNDO[6]="Haken [x] -> [ ] abwählen und [Enter] drücken: Stoppt den Stack per 'docker compose down', setzt das Image/Compose-File auf den Rollback-Tag zurück und startet neu."
 
     M_CAT[7]="III. BSI-Workarounds"; M_TITLE[7]="BSI-Drop-in (upload_progress/post_max)"
     M_RISK[7]="NIEDRIG-MITTEL (temporärer Workaround gemäß BSI v1.1)"
-    M_WHAT[7]="Legt 99-php2shell-mitigation.ini an: setzt session.upload_progress.enabled=0 und fatal_error_backtraces=0 (gegen CVE-2026-109619), begrenzt post_max_size auf 8M bzw. 32M (gegen CVE-2026-109618) und setzt expose_php=0."
+    M_WHAT[7]="Legt 99-php2shell-mitigation.ini an: setzt session.upload_progress.enabled=0 und fatal_error_backtraces=0 (gegen CVE-2026-109619 & phpAfterShell CVE-2026-126714), begrenzt post_max_size auf 8M bzw. 32M (gegen CVE-2026-109618), setzt session.use_strict_mode=1 und setzt expose_php=0."
     M_IMPACT[7]="Upload-Fortschrittsbalken über Sessions sind deaktiviert; übergroße POST-Requests werden abgelehnt. Ist die Datei vorhanden, ist [x] gesetzt."
     M_UNDO[7]="Haken [x] -> [ ] abwählen und [Enter] drücken: Entfernt 99-php2shell-mitigation.ini aus allen conf.d-Ordnern und bietet Dienst-Neustart an."
 
@@ -5732,10 +5849,10 @@ tui_befund_screen() {
     blines+=("  ${B}Server:${N} ${host_str}   ${B}System:${N} ${os_str}   ${B}CRIT:${N} ${R}${B}${CRIT}${N}   ${B}WARN:${N} ${Y}${B}${WARN}${N}   ${B}COMP:${N} ${R}${B}${COMP}${N}   ${B}ATT:${N} ${Y}${B}${ATT}${N}")
     blines+=("")
     if [ "$UI_LANG" = "en" ]; then
-      blines+=("  This tool audits the server for ${B}CVE-2026-109618 & CVE-2026-109619 (PHP2Shell)${N} per BSI advisory.")
+      blines+=("  This tool audits the server for ${B}CVE-2026-109618 & CVE-2026-109619 (PHP2Shell)${N}, ${B}CVE-2026-126714 (phpAfterShell)${N}, and ${B}Nov 19, 2026 fixes${N}.")
       blines+=("  No changes have been made yet. You decide in the next steps which actions to apply or roll back.")
     else
-      blines+=("  Dieses Werkzeug prueft den Server auf ${B}CVE-2026-109618 & CVE-2026-109619 (PHP2Shell)${N} gemaess BSI-Warnung.")
+      blines+=("  Dieses Werkzeug prueft den Server auf ${B}CVE-2026-109618 & CVE-2026-109619 (PHP2Shell)${N}, ${B}CVE-2026-126714 (phpAfterShell)${N} sowie die ${B}Releases vom 19.11.2026${N}.")
       blines+=("  Es wurde noch nichts veraendert. Sie entscheiden in den naechsten Schritten selbst, was umgesetzt wird.")
     fi
     blines+=("")
@@ -6324,7 +6441,7 @@ elif [ "$(id -u)" -eq 0 ]; then
   exec > >(tee "$SCAN_CAPTURED") 2>&1
 fi
 
-printf '%sPHP2Shell-Check v%s%s  (CVE-2026-109618 / CVE-2026-109619 | BSI BITS-H 2026-297981-1132 v1.1)  Host: %s  Zeit: %s\n' \
+printf '%sPHP2Shell-Check v%s%s  (CVE-2026-109618/19, CVE-2026-126714 phpAfterShell | BSI BITS-H 2026-297981-1132 v1.1)  Host: %s  Zeit: %s\n' \
   "$B" "$VERSION" "$N" "$(hostname)" "$(date '+%F %T %Z')"
 [ "$(id -u)" -eq 0 ] || warn "Nicht als root gestartet - Prüfungen sind eingeschränkt (Logs, Crontabs, /proc), Maßnahmen sind deaktiviert."
 
